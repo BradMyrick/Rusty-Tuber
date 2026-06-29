@@ -1,0 +1,94 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Rusty-Tuber Control</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; }
+  body {
+    background: #0d1117;
+    color: #e6edf3;
+    font: 14px/1.4 system-ui, -apple-system, Segoe UI, sans-serif;
+  }
+  main {
+    display: grid;
+    grid-template-columns: 1fr 320px;
+    height: 100vh;
+  }
+  #stage-wrap {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background:
+      linear-gradient(45deg, #161b22 25%, transparent 25%) -20px 0/40px 40px,
+      linear-gradient(-45deg, #161b22 25%, transparent 25%) -20px 0/40px 40px,
+      linear-gradient(45deg, transparent 75%, #161b22 75%) 0 0/40px 40px,
+      linear-gradient(-45deg, transparent 75%, #161b22 75%) 0 0/40px 40px,
+      #0d1117;
+  }
+  #avatar { max-width: 100%; max-height: 100%; object-fit: contain; }
+  #controls {
+    padding: 16px;
+    border-left: 1px solid #21262d;
+    background: #010409;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+  }
+  h1 { font-size: 16px; margin: 0; display: flex; align-items: center; gap: 8px; }
+  #dot { width: 10px; height: 10px; border-radius: 50%; background: #f85149; box-shadow: 0 0 6px #f85149; }
+  #dot.ok { background: #3fb950; box-shadow: 0 0 6px #3fb950; }
+  .label { font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: #7d8590; }
+  #meter { height: 10px; background: #21262d; border-radius: 6px; overflow: hidden; }
+  #meter-fill { height: 100%; width: 0%; background: linear-gradient(90deg, #2f81f7, #a371f7); transition: width 60ms linear; }
+  .btn-row { display: flex; flex-wrap: wrap; gap: 6px; }
+  button {
+    background: #21262d;
+    color: #e6edf3;
+    border: 1px solid #30363d;
+    border-radius: 6px;
+    padding: 8px 12px;
+    cursor: pointer;
+    font: inherit;
+    transition: background 80ms, border-color 80ms;
+  }
+  button:hover { background: #30363d; }
+  button.active { background: #1f6feb; border-color: #1f6feb; }
+  button.default-emo { border-color: #3fb950; }
+  .mouth button.auto { border-style: dashed; }
+  .hint { color: #7d8590; font-size: 12px; }
+  code { background: #161b22; padding: 1px 5px; border-radius: 4px; }
+</style>
+</head>
+<body data-mode="panel">
+  <main>
+    <section id="stage-wrap"><img id="avatar" alt="avatar" /></section>
+    <section id="controls">
+      <h1><span id="dot"></span> Rusty-Tuber</h1>
+      <div>
+        <div class="label">Volume</div>
+        <div id="meter"><div id="meter-fill"></div></div>
+      </div>
+      <div>
+        <div class="label">Emotions</div>
+        <div id="emotions" class="btn-row"></div>
+      </div>
+      <div class="btn-row">
+        <button id="clear" title="Return to the resting emotion now">Clear override</button>
+      </div>
+      <div>
+        <div class="label">Mouth (overrides mic)</div>
+        <div id="mouth" class="btn-row mouth"></div>
+      </div>
+      <div class="hint">
+        OBS Browser Source: point at <code id="stage-url"></code>
+      </div>
+    </section>
+  </main>
+  <script src="app.js"></script>
+</body>
+</html>

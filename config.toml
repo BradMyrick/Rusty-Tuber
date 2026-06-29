@@ -1,0 +1,28 @@
+# Rusty-Tuber configuration. All tunables live here.
+# See README.md for the full asset layout and OBS setup.
+
+[audio]
+sample_rate = 44100      # Target sample rate (Hz). cpal negotiates; not guaranteed.
+buffer_size = 1024       # Preferred frames per buffer.
+smoothing_factor = 0.35  # EMA weight on the newest RMS sample (0..1). Lower = smoother/slower.
+mode = "input"           # "input" (mic) | "loopback" (system output via a monitor device)
+device = ""              # "" = system default. Else exact name from `rusty-tuber --list-audio-devices`.
+
+[thresholds]
+# RMS level that must be exceeded to open the mouth to each state.
+# Must satisfy slight < medium < open.
+slight = 0.02
+medium = 0.08
+open = 0.18
+
+[engine]
+default_emotion = "calm"
+asset_root = "./assets/characters/default_macaw"
+bind = "127.0.0.1:8080"  # OBS Browser Source should point at http://<bind>/
+
+# Emotion auto-revert timers, in seconds.
+# Omit an emotion here to make it stick until manually cleared.
+[timers]
+surprised = 2.5
+pleased = 3.0
+laughing = 1.5

@@ -1,0 +1,38 @@
+[package]
+name = "rusty-tuber"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "High-performance PNG-Tuber: drive a PNG avatar from your mic and emote via a webapp, composited into OBS as a Browser Source."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/kodr/Rusty-Tuber"
+
+[[bin]]
+name = "rusty-tuber"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "fs", "signal", "io-util"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+cpal = "0.15"
+axum = { version = "0.7", features = ["ws"] }
+tower-http = { version = "0.5", features = ["fs", "cors", "trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+rust-embed = "8"
+mime_guess = "2"
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }
+
+[dev-dependencies]
+pretty_assertions = "1"
+tokio-tungstenite = { version = "0.23", features = ["connect"] }
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
