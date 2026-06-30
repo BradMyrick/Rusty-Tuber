@@ -1,0 +1,8 @@
+# Project formatting standard.
+#
+# A repo-level config takes precedence over each developer's personal
+# ~/.config/rustfmt/rustfmt.toml, so local `cargo fmt` and CI (which has no
+# personal config) always produce identical output. Without this file, a
+# developer's personal max_width can silently disagree with CI's rustfmt
+# defaults and break the fmt check.
+max_width = 80
