@@ -12,7 +12,7 @@
 
 use crate::assets::AssetCatalog;
 use crate::protocol::{
-    AvatarSnapshot, ClientMessage, MouthState, ServerMessage,
+    AvatarSnapshot, ClientMessage, EyeState, MouthState, ServerMessage,
 };
 use crate::state::StateCommand;
 use axum::extract::ws::{Message, WebSocket};
@@ -69,6 +69,7 @@ pub fn spawn_snapshot_recorder(state: Arc<AppState>) -> JoinHandle<()> {
                 Ok(ServerMessage::StateUpdate {
                     emotion,
                     mouth,
+                    eyes,
                     volume,
                     overridden,
                     frame,
@@ -77,6 +78,7 @@ pub fn spawn_snapshot_recorder(state: Arc<AppState>) -> JoinHandle<()> {
                     *snapshot.write().await = Some(AvatarSnapshot {
                         emotion,
                         mouth,
+                        eyes,
                         volume,
                         overridden,
                         frame,
@@ -140,6 +142,8 @@ fn api_router() -> Router<Arc<AppState>> {
         .route("/default/:name", post(api_set_default))
         .route("/mouth/:mouth", post(api_set_mouth))
         .route("/mouth", post(api_clear_mouth))
+        .route("/eyes/:state", post(api_set_eyes))
+        .route("/eyes", post(api_clear_eyes))
 }
 
 async fn api_catalog(State(st): State<Arc<AppState>>) -> Response {
@@ -160,11 +164,12 @@ async fn api_state(State(st): State<Arc<AppState>>) -> Response {
             let default = default_or_snapshot(&st).await;
             let frame = st
                 .catalog
-                .frame_url(&default, MouthState::Closed)
+                .frame_url(&default, MouthState::Closed, EyeState::Open)
                 .unwrap_or_default();
             Json(AvatarSnapshot {
                 emotion: default,
                 mouth: MouthState::Closed,
+                eyes: EyeState::Open,
                 volume: 0.0,
                 overridden: false,
                 frame,
@@ -227,6 +232,28 @@ async fn api_set_mouth(
 
 async fn api_clear_mouth(State(st): State<Arc<AppState>>) -> Response {
     let _ = st.cmd_tx.send(StateCommand::ClearMouthOverride);
+    StatusCode::NO_CONTENT.into_response()
+}
+
+async fn api_set_eyes(
+    State(st): State<Arc<AppState>>,
+    Path(state): Path<String>,
+) -> Response {
+    match EyeState::from_str_ci(&state) {
+        Some(e) => {
+            let _ = st.cmd_tx.send(StateCommand::SetEyesOverride(e));
+            StatusCode::NO_CONTENT.into_response()
+        }
+        None => (
+            StatusCode::BAD_REQUEST,
+            format!("invalid eyes: {state} (expected open|closed)"),
+        )
+            .into_response(),
+    }
+}
+
+async fn api_clear_eyes(State(st): State<Arc<AppState>>) -> Response {
+    let _ = st.cmd_tx.send(StateCommand::ClearEyesOverride);
     StatusCode::NO_CONTENT.into_response()
 }
 
@@ -318,6 +345,12 @@ async fn handle_client_text(
         }
         Ok(ClientMessage::ClearMouthOverride) => {
             let _ = st.cmd_tx.send(StateCommand::ClearMouthOverride);
+        }
+        Ok(ClientMessage::SetEyesOverride { eyes }) => {
+            let _ = st.cmd_tx.send(StateCommand::SetEyesOverride(eyes));
+        }
+        Ok(ClientMessage::ClearEyesOverride) => {
+            let _ = st.cmd_tx.send(StateCommand::ClearEyesOverride);
         }
         Ok(ClientMessage::Hello) => {}
         Err(e) => {

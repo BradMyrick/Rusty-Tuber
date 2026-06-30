@@ -18,6 +18,9 @@ pub struct AppConfig {
     /// this map stick until manually cleared.
     #[serde(default)]
     pub timers: HashMap<String, f32>,
+    /// Eye-blink scheduler tuning.
+    #[serde(default)]
+    pub blink: BlinkSettings,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Default, PartialEq, Eq)]
@@ -59,6 +62,52 @@ pub struct EngineSettings {
     pub default_emotion: String,
     pub asset_root: PathBuf,
     pub bind: String,
+}
+
+fn default_true() -> bool {
+    true
+}
+fn default_blink_min() -> f32 {
+    2.5
+}
+fn default_blink_max() -> f32 {
+    6.0
+}
+fn default_blink_duration() -> f32 {
+    0.12
+}
+fn default_double_chance() -> f32 {
+    0.15
+}
+
+/// Eye-blink scheduler settings. The interval is randomised per cycle between
+/// `min_interval` and `max_interval` so blinks feel natural rather than
+/// metronomic. All fields have defaults, so a `[blink]` section (or individual
+/// keys) may be omitted.
+#[derive(Debug, Clone, Deserialize)]
+pub struct BlinkSettings {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_blink_min")]
+    pub min_interval: f32,
+    #[serde(default = "default_blink_max")]
+    pub max_interval: f32,
+    #[serde(default = "default_blink_duration")]
+    pub duration: f32,
+    #[serde(default = "default_double_chance")]
+    pub double_chance: f32,
+}
+
+impl Default for BlinkSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            min_interval: 2.5,
+            max_interval: 6.0,
+            duration: 0.12,
+            double_chance: 0.15,
+        }
+    }
 }
 
 impl AppConfig {
@@ -124,6 +173,24 @@ impl AppConfig {
             if !secs.is_finite() || *secs <= 0.0 {
                 bail!("[timers].{name} must be a positive finite number (got {secs})");
             }
+        }
+
+        let b = &self.blink;
+        if b.min_interval <= 0.0 || !b.min_interval.is_finite() {
+            bail!("[blink].min_interval must be positive and finite");
+        }
+        if b.max_interval < b.min_interval {
+            bail!(
+                "[blink].max_interval ({}) must be >= min_interval ({})",
+                b.max_interval,
+                b.min_interval
+            );
+        }
+        if b.duration <= 0.0 || !b.duration.is_finite() {
+            bail!("[blink].duration must be positive and finite");
+        }
+        if !(0.0..=1.0).contains(&b.double_chance) {
+            bail!("[blink].double_chance must be in [0.0, 1.0]");
         }
 
         Ok(())
@@ -210,5 +277,39 @@ surprised = 2.5
         assert_eq!(cfg.audio.sample_rate, 48000);
         assert_eq!(cfg.engine.bind, "0.0.0.0:9000");
         assert_eq!(cfg.timers.get("surprised"), Some(&2.5_f32));
+    }
+
+    #[test]
+    fn blink_defaults_when_section_absent() {
+        let cfg = AppConfig::from_toml_str(MINIMAL).unwrap();
+        assert!(cfg.blink.enabled);
+        assert_eq!(cfg.blink.min_interval, 2.5);
+        assert_eq!(cfg.blink.max_interval, 6.0);
+        assert!((cfg.blink.duration - 0.12).abs() < 1e-6);
+    }
+
+    #[test]
+    fn blink_partial_section_uses_field_defaults() {
+        let raw = format!(
+            "{MINIMAL}\n[blink]\nenabled = false\nmin_interval = 3.0\n"
+        );
+        let cfg = AppConfig::from_toml_str(&raw).unwrap();
+        assert!(!cfg.blink.enabled);
+        assert_eq!(cfg.blink.min_interval, 3.0);
+        // omitted fields keep defaults
+        assert_eq!(cfg.blink.max_interval, 6.0);
+        assert!((cfg.blink.duration - 0.12).abs() < 1e-6);
+    }
+
+    #[test]
+    fn blink_rejects_bad_ranges() {
+        let mk = |toml: &str| {
+            AppConfig::from_toml_str(&format!("{MINIMAL}\n{toml}"))
+        };
+        assert!(
+            mk("[blink]\nmin_interval = 5.0\nmax_interval = 2.0\n").is_err()
+        );
+        assert!(mk("[blink]\nduration = 0.0\n").is_err());
+        assert!(mk("[blink]\ndouble_chance = 2.0\n").is_err());
     }
 }

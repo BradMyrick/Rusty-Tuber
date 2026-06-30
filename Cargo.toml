@@ -25,6 +25,7 @@ rust-embed = "8"
 mime_guess = "2"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
+rand = "0.8"
 futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }
 
 [dev-dependencies]

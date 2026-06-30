@@ -51,27 +51,57 @@ impl MouthState {
     }
 }
 
-/// Resolved on-disk frames for one emotion, expressed as paths **relative to
-/// the asset root** using forward slashes (URL-ready: prepend `/frames/`).
-///
-/// `closed` and `open` are mandatory; `slight`/`medium` are optional and the
-/// resolver snaps to the nearest available frame when they are absent.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FrameSet {
-    pub closed: String,
-    pub slight: Option<String>,
-    pub medium: Option<String>,
-    pub open: String,
+/// Eye state. `Open` is the resting state; `Closed` is shown during a blink.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum EyeState {
+    #[default]
+    Open,
+    Closed,
 }
 
-/// Catalog snapshot pushed to clients on connect: emotion name -> frames.
-pub type Catalog = BTreeMap<String, FrameSet>;
+impl EyeState {
+    /// Case-insensitive parse, tolerant of the JSON-serialized form.
+    pub fn from_str_ci(s: &str) -> Option<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "open" => Some(EyeState::Open),
+            "closed" => Some(EyeState::Closed),
+            _ => None,
+        }
+    }
+}
+
+/// The available mouth frames for one eye state. `closed` and `open` are the
+/// meaningful anchors; `slight`/`medium` are optional. Paths are relative to
+/// the asset root (URL-ready: prepend `/frames/`).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct MouthSet {
+    pub closed: Option<String>,
+    pub slight: Option<String>,
+    pub medium: Option<String>,
+    pub open: Option<String>,
+}
+
+/// All frames for one emotion, split by eye state. `eyes_open` is required
+/// (the resting avatar); `eyes_closed` holds the blink (`*-blink.png`) frames
+/// and is optional — when absent, blinks fall back to `eyes_open`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FrameGrid {
+    pub eyes_open: MouthSet,
+    pub eyes_closed: Option<MouthSet>,
+}
+
+/// Catalog snapshot pushed to clients on connect: emotion name -> frame grid.
+pub type Catalog = BTreeMap<String, FrameGrid>;
 
 /// Serializable avatar snapshot, used for the REST `GET /api/state` endpoint.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct AvatarSnapshot {
     pub emotion: String,
     pub mouth: MouthState,
+    pub eyes: EyeState,
     pub volume: f32,
     pub overridden: bool,
     pub frame: String,
@@ -96,6 +126,10 @@ pub enum ClientMessage {
     SetMouthOverride { mouth: MouthState },
     /// Release a forced mouth shape; resume mic-driven motion.
     ClearMouthOverride,
+    /// Force the eyes open or closed, ignoring the blink scheduler.
+    SetEyesOverride { eyes: EyeState },
+    /// Release a forced eye state; resume blinking.
+    ClearEyesOverride,
     /// First message a client sends after connecting (optional handshake).
     Hello,
 }
@@ -120,6 +154,7 @@ pub enum ServerMessage {
     StateUpdate {
         emotion: String,
         mouth: MouthState,
+        eyes: EyeState,
         volume: f32,
         overridden: bool,
         frame: String,
@@ -158,9 +193,10 @@ mod tests {
         let msg = ServerMessage::StateUpdate {
             emotion: "angry".into(),
             mouth: MouthState::Open,
+            eyes: EyeState::Closed,
             volume: 0.42,
             overridden: true,
-            frame: "/frames/angry/open.png".into(),
+            frame: "/frames/angry/open-blink.png".into(),
             default_emotion: "calm".into(),
         };
         let s = serde_json::to_string(&msg).unwrap();
@@ -169,12 +205,14 @@ mod tests {
             ServerMessage::StateUpdate {
                 emotion,
                 mouth,
+                eyes,
                 volume,
                 default_emotion,
                 ..
             } => {
                 assert_eq!(emotion, "angry");
                 assert_eq!(mouth, MouthState::Open);
+                assert_eq!(eyes, EyeState::Closed);
                 assert!((volume - 0.42).abs() < 1e-9);
                 assert_eq!(default_emotion, "calm");
             }

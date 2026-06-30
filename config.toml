@@ -26,3 +26,12 @@ bind = "127.0.0.1:8080"  # OBS Browser Source should point at http://<bind>/
 surprised = 2.5
 pleased = 3.0
 laughing = 1.5
+
+# Eye-blink scheduler. Optional — every key has a default, so you can omit the
+# whole section. Blink frames are <mouth>-blink.png per emotion folder.
+[blink]
+enabled = true             # Set false to disable blinking entirely.
+min_interval = 2.5         # Seconds between blinks (randomised in [min, max]).
+max_interval = 6.0
+duration = 0.12            # Seconds the eyes stay closed per blink.
+double_chance = 0.15       # Probability of a quick double-blink.

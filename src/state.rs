@@ -12,8 +12,10 @@
 //! so the web-app meter stays lively without flooding slow clients.
 
 use crate::assets::AssetCatalog;
-use crate::config::ThresholdSettings;
-use crate::protocol::{MouthState, ServerMessage};
+use crate::config::{BlinkSettings, ThresholdSettings};
+use crate::protocol::{EyeState, MouthState, ServerMessage};
+use rand::rngs::StdRng;
+use rand::{Rng, SeedableRng};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -40,6 +42,15 @@ pub enum StateCommand {
     SetMouthOverride(MouthState),
     /// Client released a forced mouth shape.
     ClearMouthOverride,
+    /// Internal: the blink scheduler closed the eyes.
+    BlinkClose,
+    /// Internal: the blink scheduler opened the eyes.
+    BlinkOpen,
+    /// Client forced the eyes open/closed (disables the blink scheduler's
+    /// effect until cleared).
+    SetEyesOverride(EyeState),
+    /// Client released a forced eye state; resume blinking.
+    ClearEyesOverride,
     /// Internal: a revert-timer fired. Only applied if `token` equals the
     /// currently active token.
     TimerClear(u64),
@@ -79,13 +90,16 @@ pub fn spawn(
         default_emotion: default_emotion.clone(),
         emotion_override: None,
         mouth_override: None,
+        eyes_override: None,
         mouth: MouthState::Closed,
+        eyes: EyeState::Open,
         volume: 0.0,
         active_token: 0,
         cmd_tx,
         bcast,
         last_sent_emotion: default_emotion,
         last_sent_mouth: MouthState::Closed,
+        last_sent_eyes: EyeState::Open,
         last_vol_broadcast: Instant::now(),
     };
 
@@ -108,8 +122,11 @@ struct StateMachine {
     default_emotion: String,
     emotion_override: Option<String>,
     mouth_override: Option<MouthState>,
+    eyes_override: Option<EyeState>,
     /// Mic-derived mouth (ignored while `mouth_override` is `Some`).
     mouth: MouthState,
+    /// Blink-derived eyes (ignored while `eyes_override` is `Some`).
+    eyes: EyeState,
     volume: f32,
     /// Bumped on every emotion trigger; stale timers carry an older token.
     active_token: u64,
@@ -117,6 +134,7 @@ struct StateMachine {
     bcast: broadcast::Sender<ServerMessage>,
     last_sent_emotion: String,
     last_sent_mouth: MouthState,
+    last_sent_eyes: EyeState,
     last_vol_broadcast: Instant,
 }
 
@@ -131,6 +149,21 @@ impl StateMachine {
         self.mouth_override.unwrap_or(self.mouth)
     }
 
+    fn effective_eyes(&self) -> EyeState {
+        self.eyes_override.unwrap_or(self.eyes)
+    }
+
+    /// The currently-displayed frame URL (for change detection).
+    fn current_frame(&self) -> String {
+        self.catalog
+            .frame_url(
+                self.effective_emotion(),
+                self.effective_mouth(),
+                self.effective_eyes(),
+            )
+            .unwrap_or_default()
+    }
+
     fn handle(&mut self, cmd: StateCommand) {
         match cmd {
             StateCommand::SetVolume(v) => {
@@ -141,13 +174,15 @@ impl StateMachine {
                 let now = Instant::now();
                 let emotion = self.effective_emotion().to_string();
                 let mouth = self.effective_mouth();
+                let eyes = self.effective_eyes();
                 let changed = emotion != self.last_sent_emotion
-                    || mouth != self.last_sent_mouth;
+                    || mouth != self.last_sent_mouth
+                    || eyes != self.last_sent_eyes;
                 if changed
                     || now.duration_since(self.last_vol_broadcast)
                         >= VOLUME_BROADCAST_INTERVAL
                 {
-                    self.broadcast(&emotion, mouth, now);
+                    self.broadcast(&emotion, mouth, eyes, now);
                 }
             }
             StateCommand::TriggerEmotion(emotion) => {
@@ -193,6 +228,36 @@ impl StateMachine {
                 self.mouth_override = None;
                 self.broadcast_now();
             }
+            StateCommand::BlinkClose => {
+                // A manual eyes override pauses the scheduler entirely.
+                if self.eyes_override.is_none() {
+                    let before = self.current_frame();
+                    self.eyes = EyeState::Closed;
+                    // Only broadcast when the visible frame actually changes
+                    // (e.g. an emotion with no blink art resolves to the same
+                    // eyes-open frame, so nothing is sent).
+                    if self.current_frame() != before {
+                        self.broadcast_now();
+                    }
+                }
+            }
+            StateCommand::BlinkOpen => {
+                if self.eyes_override.is_none() {
+                    let before = self.current_frame();
+                    self.eyes = EyeState::Open;
+                    if self.current_frame() != before {
+                        self.broadcast_now();
+                    }
+                }
+            }
+            StateCommand::SetEyesOverride(eyes) => {
+                self.eyes_override = Some(eyes);
+                self.broadcast_now();
+            }
+            StateCommand::ClearEyesOverride => {
+                self.eyes_override = None;
+                self.broadcast_now();
+            }
             StateCommand::Shutdown => unreachable!("handled by the run loop"),
         }
     }
@@ -201,16 +266,28 @@ impl StateMachine {
     fn broadcast_now(&mut self) {
         let emotion = self.effective_emotion().to_string();
         let mouth = self.effective_mouth();
-        self.broadcast(&emotion, mouth, Instant::now());
+        let eyes = self.effective_eyes();
+        self.broadcast(&emotion, mouth, eyes, Instant::now());
     }
 
-    fn broadcast(&mut self, emotion: &str, mouth: MouthState, now: Instant) {
-        let frame = self.catalog.frame_url(emotion, mouth).unwrap_or_default();
-        let overridden =
-            self.emotion_override.is_some() || self.mouth_override.is_some();
+    fn broadcast(
+        &mut self,
+        emotion: &str,
+        mouth: MouthState,
+        eyes: EyeState,
+        now: Instant,
+    ) {
+        let frame = self
+            .catalog
+            .frame_url(emotion, mouth, eyes)
+            .unwrap_or_default();
+        let overridden = self.emotion_override.is_some()
+            || self.mouth_override.is_some()
+            || self.eyes_override.is_some();
         let msg = ServerMessage::StateUpdate {
             emotion: emotion.to_string(),
             mouth,
+            eyes,
             volume: self.volume,
             overridden,
             frame,
@@ -220,35 +297,122 @@ impl StateMachine {
         let _ = self.bcast.send(msg);
         self.last_sent_emotion = emotion.to_string();
         self.last_sent_mouth = mouth;
+        self.last_sent_eyes = eyes;
         self.last_vol_broadcast = now;
     }
+}
+
+/// Spawn the blink scheduler. It posts `BlinkClose`/`BlinkOpen` commands at
+/// randomised intervals until the command channel closes (on shutdown), at
+/// which point the next send fails and the loop exits. No-op if `cfg.enabled`
+/// is false. A manual eyes override (`SetEyesOverride`) masks blinks without
+/// stopping the scheduler.
+pub fn spawn_blink_scheduler(
+    cmd_tx: mpsc::UnboundedSender<StateCommand>,
+    cfg: BlinkSettings,
+) {
+    if !cfg.enabled {
+        debug!("blink scheduler disabled by config");
+        return;
+    }
+    tokio::spawn(async move {
+        let mut rng = StdRng::from_entropy();
+        loop {
+            let interval = rng.gen_range(cfg.min_interval..=cfg.max_interval);
+            tokio::time::sleep(Duration::from_secs_f32(interval)).await;
+            if cmd_tx.send(StateCommand::BlinkClose).is_err() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_secs_f32(cfg.duration)).await;
+            if cmd_tx.send(StateCommand::BlinkOpen).is_err() {
+                return;
+            }
+            // Occasional double-blink: short gap then another close/open.
+            if rng.gen_bool(f64::from(cfg.double_chance)) {
+                tokio::time::sleep(Duration::from_secs_f32(cfg.duration) * 2)
+                    .await;
+                if cmd_tx.send(StateCommand::BlinkClose).is_err() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_secs_f32(cfg.duration)).await;
+                if cmd_tx.send(StateCommand::BlinkOpen).is_err() {
+                    return;
+                }
+            }
+        }
+    });
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::assets::AssetCatalog;
-    use crate::protocol::FrameSet;
+    use crate::protocol::{FrameGrid, MouthSet};
     use std::collections::BTreeMap;
+
+    fn mouth(
+        closed: &str,
+        slight: Option<&str>,
+        medium: Option<&str>,
+        open: &str,
+    ) -> MouthSet {
+        MouthSet {
+            closed: Some(closed.into()),
+            slight: slight.map(Into::into),
+            medium: medium.map(Into::into),
+            open: Some(open.into()),
+        }
+    }
 
     fn fake_catalog() -> AssetCatalog {
         let mut m = BTreeMap::new();
+        // calm: full eyes-open + full blink set
         m.insert(
             "calm".into(),
-            FrameSet {
-                closed: "calm/closed.png".into(),
-                slight: Some("calm/slight.png".into()),
-                medium: Some("calm/medium.png".into()),
-                open: "calm/open.png".into(),
+            FrameGrid {
+                eyes_open: mouth(
+                    "calm/closed.png",
+                    Some("calm/slight.png"),
+                    Some("calm/medium.png"),
+                    "calm/open.png",
+                ),
+                eyes_closed: Some(mouth(
+                    "calm/closed-blink.png",
+                    Some("calm/slight-blink.png"),
+                    Some("calm/medium-blink.png"),
+                    "calm/open-blink.png",
+                )),
             },
         );
+        // surprised: only closed/open eyes-open, no blink art
         m.insert(
             "surprised".into(),
-            FrameSet {
-                closed: "surprised/closed.png".into(),
-                slight: None,
-                medium: None,
-                open: "surprised/open.png".into(),
+            FrameGrid {
+                eyes_open: mouth(
+                    "surprised/closed.png",
+                    None,
+                    None,
+                    "surprised/open.png",
+                ),
+                eyes_closed: None,
+            },
+        );
+        // angry: closed/open eyes-open, partial blink (closed+open only)
+        m.insert(
+            "angry".into(),
+            FrameGrid {
+                eyes_open: mouth(
+                    "angry/closed.png",
+                    None,
+                    None,
+                    "angry/open.png",
+                ),
+                eyes_closed: Some(mouth(
+                    "angry/closed-blink.png",
+                    None,
+                    None,
+                    "angry/open-blink.png",
+                )),
             },
         );
         AssetCatalog(m)
@@ -284,18 +448,34 @@ mod tests {
         (cmd_tx, bcast_rx, handle)
     }
 
-    fn unwrap_state(
-        msg: ServerMessage,
-    ) -> (String, MouthState, f32, bool, String, String) {
+    #[derive(Debug)]
+    struct S {
+        emotion: String,
+        mouth: MouthState,
+        eyes: EyeState,
+        volume: f32,
+        frame: String,
+        default_emotion: String,
+    }
+
+    fn unwrap_state(msg: ServerMessage) -> S {
         match msg {
             ServerMessage::StateUpdate {
                 emotion,
                 mouth,
+                eyes,
                 volume,
-                overridden,
+                overridden: _,
                 frame,
                 default_emotion,
-            } => (emotion, mouth, volume, overridden, frame, default_emotion),
+            } => S {
+                emotion,
+                mouth,
+                eyes,
+                volume,
+                frame,
+                default_emotion,
+            },
             other => panic!("expected StateUpdate, got {other:?}"),
         }
     }
@@ -304,13 +484,13 @@ mod tests {
     async fn volume_maps_to_mouth_and_broadcasts() {
         let (tx, mut rx, _h) = harness().await;
         tx.send(StateCommand::SetVolume(0.5)).unwrap(); // above open(0.18) -> Open
-        let msg = rx.recv().await.unwrap();
-        let (emotion, mouth, volume, _ov, frame, default) = unwrap_state(msg);
-        assert_eq!(emotion, "calm");
-        assert_eq!(mouth, MouthState::Open);
-        assert!((volume - 0.5).abs() < 1e-9);
-        assert_eq!(frame, "/frames/calm/open.png");
-        assert_eq!(default, "calm");
+        let s = unwrap_state(rx.recv().await.unwrap());
+        assert_eq!(s.emotion, "calm");
+        assert_eq!(s.mouth, MouthState::Open);
+        assert_eq!(s.eyes, EyeState::Open);
+        assert!((s.volume - 0.5).abs() < 1e-9);
+        assert_eq!(s.frame, "/frames/calm/open.png");
+        assert_eq!(s.default_emotion, "calm");
     }
 
     #[tokio::test]
@@ -318,15 +498,14 @@ mod tests {
         let (tx, mut rx, _h) = harness().await;
         tx.send(StateCommand::TriggerEmotion("surprised".into()))
             .unwrap();
-        let m1 = rx.recv().await.unwrap();
-        assert_eq!(unwrap_state(m1).0, "surprised");
+        let s = unwrap_state(rx.recv().await.unwrap());
+        assert_eq!(s.emotion, "surprised");
 
         // timer is 0.1s; should revert to calm.
         tokio::time::sleep(Duration::from_millis(250)).await;
-        // drain any messages
         let mut last = String::new();
         while let Ok(m) = rx.try_recv() {
-            last = unwrap_state(m).0;
+            last = unwrap_state(m).emotion;
         }
         assert_eq!(last, "calm", "should have reverted to calm");
     }
@@ -334,21 +513,19 @@ mod tests {
     #[tokio::test]
     async fn stale_timer_does_not_clobber_newer_emotion() {
         let (tx, mut rx, _h) = harness().await;
-        // surprised has a 0.1s timer; pleased has none.
+        // surprised has a 0.1s timer; calm has none.
         tx.send(StateCommand::TriggerEmotion("surprised".into()))
             .unwrap();
         let _ = rx.recv().await.unwrap();
-        // Immediately override with a different emotion before the timer fires.
         tx.send(StateCommand::TriggerEmotion("calm".into()))
             .unwrap();
-        let m = rx.recv().await.unwrap();
-        assert_eq!(unwrap_state(m).0, "calm");
+        let s = unwrap_state(rx.recv().await.unwrap());
+        assert_eq!(s.emotion, "calm");
 
-        // Wait past the surprised timer; the stale clear must NOT take effect.
         tokio::time::sleep(Duration::from_millis(250)).await;
         let mut still = String::from("calm");
         while let Ok(m) = rx.try_recv() {
-            still = unwrap_state(m).0;
+            still = unwrap_state(m).emotion;
         }
         assert_eq!(still, "calm", "newer emotion must remain in effect");
     }
@@ -356,7 +533,6 @@ mod tests {
     #[tokio::test]
     async fn manual_clear_override_returns_to_default() {
         let (tx, mut rx, _h) = harness().await;
-        // Trigger an emotion with no timer (calm has none) so it sticks.
         tx.send(StateCommand::TriggerEmotion("calm".into()))
             .unwrap();
         let _ = rx.recv().await.unwrap();
@@ -364,35 +540,106 @@ mod tests {
             .unwrap();
         let _ = rx.recv().await.unwrap();
         tx.send(StateCommand::ClearOverride).unwrap();
-        let m = rx.recv().await.unwrap();
-        // After clear, effective emotion == default == surprised
-        assert_eq!(unwrap_state(m).0, "surprised");
+        let s = unwrap_state(rx.recv().await.unwrap());
+        assert_eq!(s.emotion, "surprised");
     }
 
     #[tokio::test]
     async fn mouth_override_ignores_mic() {
         let (tx, mut rx, _h) = harness().await;
-        // Establish a loud baseline so the mic-driven mouth is Open.
         tx.send(StateCommand::SetVolume(0.5)).unwrap();
-        let m = rx.recv().await.unwrap();
-        assert_eq!(unwrap_state(m).1, MouthState::Open);
+        let s = unwrap_state(rx.recv().await.unwrap());
+        assert_eq!(s.mouth, MouthState::Open);
 
-        // Pin the mouth to Closed regardless of input.
         tx.send(StateCommand::SetMouthOverride(MouthState::Closed))
             .unwrap();
-        let m = rx.recv().await.unwrap();
-        assert_eq!(unwrap_state(m).1, MouthState::Closed);
+        let s = unwrap_state(rx.recv().await.unwrap());
+        assert_eq!(s.mouth, MouthState::Closed);
 
-        // Wait past the volume throttle, then push another loud sample. The
-        // override must win, so the effective mouth stays Closed.
         tokio::time::sleep(
             VOLUME_BROADCAST_INTERVAL + Duration::from_millis(20),
         )
         .await;
         tx.send(StateCommand::SetVolume(0.5)).unwrap();
-        let m = rx.recv().await.unwrap();
-        let (_, mouth, volume, _, _, _) = unwrap_state(m);
-        assert_eq!(mouth, MouthState::Closed, "override must win over mic");
-        assert!((volume - 0.5).abs() < 1e-9);
+        let s = unwrap_state(rx.recv().await.unwrap());
+        assert_eq!(s.mouth, MouthState::Closed, "override must win over mic");
+        assert!((s.volume - 0.5).abs() < 1e-9);
+    }
+
+    #[tokio::test]
+    async fn blink_swaps_to_closed_eye_frame() {
+        let (tx, mut rx, _h) = harness().await;
+        // Establish eyes-open baseline on calm.
+        tx.send(StateCommand::SetVolume(0.5)).unwrap(); // mouth Open
+        let _ = unwrap_state(rx.recv().await.unwrap());
+
+        tx.send(StateCommand::BlinkClose).unwrap();
+        let s = unwrap_state(rx.recv().await.unwrap());
+        assert_eq!(s.eyes, EyeState::Closed);
+        assert_eq!(s.frame, "/frames/calm/open-blink.png");
+
+        tx.send(StateCommand::BlinkOpen).unwrap();
+        let s = unwrap_state(rx.recv().await.unwrap());
+        assert_eq!(s.eyes, EyeState::Open);
+        assert_eq!(s.frame, "/frames/calm/open.png");
+    }
+
+    #[tokio::test]
+    async fn blink_falls_back_to_eyes_open_without_blink_art() {
+        let (tx, mut rx, _h) = harness().await;
+        tx.send(StateCommand::TriggerEmotion("surprised".into()))
+            .unwrap();
+        let _ = unwrap_state(rx.recv().await.unwrap());
+        tx.send(StateCommand::SetVolume(0.5)).unwrap(); // mouth Open on surprised
+        let _ = unwrap_state(rx.recv().await.unwrap());
+
+        // surprised has no blink art: BlinkClose must NOT change the frame.
+        tx.send(StateCommand::BlinkClose).unwrap();
+        // No broadcast is expected (effective eyes unchanged) — nothing to read.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            rx.try_recv().is_err(),
+            "no broadcast when blink has no effect"
+        );
+    }
+
+    #[tokio::test]
+    async fn blink_snaps_mouth_within_eyes_closed() {
+        let (tx, mut rx, _h) = harness().await;
+        // angry has blink art only for closed+open. Medium snaps to open-blink.
+        tx.send(StateCommand::TriggerEmotion("angry".into()))
+            .unwrap();
+        let _ = unwrap_state(rx.recv().await.unwrap());
+        tx.send(StateCommand::SetVolume(0.1)).unwrap(); // mouth Medium (>=0.08,<0.18)
+        let _ = unwrap_state(rx.recv().await.unwrap());
+        tx.send(StateCommand::BlinkClose).unwrap();
+        let s = unwrap_state(rx.recv().await.unwrap());
+        assert_eq!(s.frame, "/frames/angry/open-blink.png");
+    }
+
+    #[tokio::test]
+    async fn eyes_override_masks_blink() {
+        let (tx, mut rx, _h) = harness().await;
+        tx.send(StateCommand::SetVolume(0.5)).unwrap();
+        let _ = unwrap_state(rx.recv().await.unwrap());
+
+        // Force eyes open: a subsequent BlinkClose must not change them.
+        tx.send(StateCommand::SetEyesOverride(EyeState::Open))
+            .unwrap();
+        let _ = unwrap_state(rx.recv().await.unwrap());
+        tx.send(StateCommand::BlinkClose).unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(rx.try_recv().is_err(), "override must mask the blink");
+
+        // Force eyes closed and clear: blinking resumes.
+        tx.send(StateCommand::SetEyesOverride(EyeState::Closed))
+            .unwrap();
+        let s = unwrap_state(rx.recv().await.unwrap());
+        assert_eq!(s.eyes, EyeState::Closed);
+        tx.send(StateCommand::ClearEyesOverride).unwrap();
+        let s = unwrap_state(rx.recv().await.unwrap());
+        // After clearing, effective eyes == self.eyes which was last set Open by BlinkOpen? No
+        // BlinkOpen never fired; self.eyes is still Open from init. So effective -> Open.
+        assert_eq!(s.eyes, EyeState::Open);
     }
 }

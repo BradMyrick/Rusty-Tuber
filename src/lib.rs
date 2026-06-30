@@ -49,6 +49,10 @@ pub async fn run(cfg: config::AppConfig) -> Result<()> {
         bcast_tx.clone(),
     );
 
+    // Eye-blink scheduler: posts BlinkClose/BlinkOpen at randomised intervals
+    // until the command channel closes on shutdown.
+    state::spawn_blink_scheduler(cmd_tx.clone(), cfg.blink.clone());
+
     // --- Shared HTTP/WS state ----------------------------------------------
     let app_state = Arc::new(net::AppState {
         catalog: catalog.clone(),

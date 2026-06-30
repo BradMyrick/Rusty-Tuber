@@ -61,13 +61,21 @@ async fn rest_catalog_lists_all_emotions() {
         emotions.iter().map(|v| v.as_str().unwrap()).collect();
     assert!(names.contains(&"calm"));
     assert!(names.contains(&"surprised"));
-    // full frame set for calm
+    // calm: full eyes-open set + eyes-closed (blink) set
     assert_eq!(
-        body["frames"]["calm"]["slight"].as_str(),
+        body["frames"]["calm"]["eyes_open"]["slight"].as_str(),
         Some("calm/slight.png")
     );
-    // partial set for surprised (no slight/medium)
-    assert!(body["frames"]["surprised"]["slight"].is_null());
+    assert_eq!(
+        body["frames"]["calm"]["eyes_closed"]["closed"].as_str(),
+        Some("calm/closed-blink.png")
+    );
+    // surprised: eyes-open has only closed/open; eyes-closed (blink) has closed+open
+    assert!(body["frames"]["surprised"]["eyes_open"]["slight"].is_null());
+    assert_eq!(
+        body["frames"]["surprised"]["eyes_closed"]["closed"].as_str(),
+        Some("surprised/closed-blink.png")
+    );
 }
 
 #[tokio::test]
@@ -204,4 +212,89 @@ async fn ws_unknown_emotion_replies_error() {
         saw_error,
         "server should reject unknown emotions with an Error"
     );
+}
+
+#[tokio::test]
+async fn rest_eyes_override_swaps_to_blink_frame() {
+    let base = spawn_server().await;
+    let client = http();
+
+    // calm has blink art; forcing eyes closed should resolve to a *-blink frame.
+    let status = client
+        .post(format!("{base}/api/eyes/closed"))
+        .send()
+        .await
+        .unwrap()
+        .status();
+    assert_eq!(status.as_u16(), 204);
+
+    let st: serde_json::Value = client
+        .get(format!("{base}/api/state"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(st["eyes"].as_str(), Some("closed"));
+    assert!(
+        st["frame"].as_str().unwrap().ends_with("-blink.png"),
+        "frame should be a blink variant, got {}",
+        st["frame"]
+    );
+
+    // Invalid state is rejected.
+    let status = client
+        .post(format!("{base}/api/eyes/squint"))
+        .send()
+        .await
+        .unwrap()
+        .status();
+    assert_eq!(status.as_u16(), 400);
+
+    // Clearing returns to open eyes.
+    client
+        .post(format!("{base}/api/eyes"))
+        .send()
+        .await
+        .unwrap();
+    let st: serde_json::Value = client
+        .get(format!("{base}/api/state"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(st["eyes"].as_str(), Some("open"));
+}
+
+#[tokio::test]
+async fn ws_eyes_override_via_protocol() {
+    let base = spawn_server().await;
+    let ws_url = base.replacen("http://", "ws://", 1) + "/ws";
+    let (mut socket, _) = connect_async(&ws_url).await.unwrap();
+    let _ = socket.next().await.unwrap(); // Welcome
+
+    socket
+        .send(tokio_tungstenite::tungstenite::Message::Text(
+            r#"{"type":"SetEyesOverride","payload":{"eyes":"closed"}}"#.into(),
+        ))
+        .await
+        .unwrap();
+
+    let mut saw_closed = false;
+    for _ in 0..20 {
+        let msg = serde_json::from_str::<serde_json::Value>(
+            &socket.next().await.unwrap().unwrap().into_text().unwrap(),
+        )
+        .unwrap();
+        if msg["type"].as_str() == Some("StateUpdate")
+            && msg["payload"]["eyes"].as_str() == Some("closed")
+        {
+            saw_closed = true;
+            break;
+        }
+    }
+    assert!(saw_closed, "should have received a closed-eyes StateUpdate");
 }
