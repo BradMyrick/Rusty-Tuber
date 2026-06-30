@@ -5,7 +5,7 @@ edition = "2021"
 rust-version = "1.75"
 description = "High-performance PNG-Tuber: drive a PNG avatar from your mic and emote via a webapp, composited into OBS as a Browser Source."
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/kodr/Rusty-Tuber"
+repository = "https://github.com/BradMyrick/Rusty-Tuber"
 
 [[bin]]
 name = "rusty-tuber"

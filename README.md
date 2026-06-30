@@ -25,6 +25,16 @@ microphone volume and trigger emotions from a built-in web app, composited into
 
 ## Quick start
 
+**Linux prerequisite:** install the ALSA development headers (cpal needs them
+to build its audio backend):
+
+```bash
+sudo apt-get install -y libasound2-dev pkg-config   # Debian/Ubuntu
+# Fedora: sudo dnf install -y alsa-lib-devel
+```
+
+macOS and Windows need no extra system packages (CoreAudio / WASAPI ship with the OS).
+
 ```bash
 # 1. Build
 cargo build --release
@@ -272,8 +282,13 @@ RUST_LOG=debug cargo run        # verbose logging
 
 The integration test (`tests/integration.rs`) spins up the real router on an
 ephemeral port against the bundled catalog and exercises the REST + WebSocket
-contract, including the auto-revert timer.
+contract, including the auto-revert timer and the blink/eyes override.
+
+CI (`.github/workflows/rust.yml`) runs the same fmt + clippy + test gates on
+every push and pull request.
 
 ## License
 
-MIT OR Apache-2.0.
+Dual-licensed under either of [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE)
+at your option. Unless you explicitly state otherwise, any contribution
+intentionally submitted for inclusion shall be dual-licensed as above.
