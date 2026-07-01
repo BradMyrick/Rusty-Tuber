@@ -130,6 +130,29 @@ impl MouthConfig {
     }
 }
 
+/// Audio envelope tuning: `attack_ms` is how fast the mouth opens on talk-start
+/// (smaller = snappier), `release_ms` how gently it closes on talk-end (larger =
+/// smoother, less flutter). Drives the asymmetric one-pole envelope in the audio
+/// callback; adjustable live from the panel.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EnvelopeConfig {
+    pub attack_ms: f32,
+    pub release_ms: f32,
+}
+
+impl EnvelopeConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        for v in [self.attack_ms, self.release_ms] {
+            if !v.is_finite() || !(0.1..=2000.0).contains(&v) {
+                return Err(format!(
+                    "attack_ms/release_ms must be in [0.1, 2000] ms (got {v})"
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Eye state. `Open` is the resting state; `Closed` is shown during a blink.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default,
@@ -227,6 +250,8 @@ pub enum ClientMessage {
     ClearMouthOverride,
     /// Update the mouth-level configuration (enabled levels + thresholds).
     SetMouthConfig { config: MouthConfig },
+    /// Update the audio envelope (attack/release).
+    SetEnvelope { config: EnvelopeConfig },
     /// Force the eyes open or closed, ignoring the blink scheduler.
     SetEyesOverride { eyes: EyeState },
     /// Release a forced eye state; resume blinking.
@@ -243,13 +268,18 @@ pub enum ClientMessage {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "payload", rename_all = "PascalCase")]
 pub enum ServerMessage {
-    /// Sent once on (re)connect: the full layered asset catalog (for stacking
-    /// and preloading), the current resting emotion, and the mouth-level
-    /// configuration (so the panel can populate its tuning controls).
+    /// Sent once on (re)connect: the full layered asset catalog (for the panel
+    /// UI), the current resting emotion, the mouth-level configuration, and the
+    /// composited frame dimensions (so the client sizes its canvas for the raw
+    /// RGBA frames it receives over the binary WS channel).
     Welcome {
         catalog: LayerCatalog,
         default_emotion: String,
         mouth_config: MouthConfig,
+        envelope: EnvelopeConfig,
+        latency: String,
+        frame_width: u32,
+        frame_height: u32,
     },
     /// Authoritative avatar state. Sent on every change and throttled for
     /// volume-only drift. `eyes_frame` / `mouth_frame` are the resolved layer
@@ -274,6 +304,8 @@ pub enum ServerMessage {
     /// Broadcast whenever the mouth-level configuration changes (via panel or
     /// REST) so every connected panel stays in sync. OBS sources ignore this.
     MouthConfigUpdate { config: MouthConfig },
+    /// Broadcast whenever the audio envelope changes.
+    EnvelopeUpdate { config: EnvelopeConfig },
 }
 
 #[cfg(test)]
@@ -370,6 +402,13 @@ mod tests {
             catalog: cat,
             default_emotion: "default".into(),
             mouth_config: MouthConfig::all_enabled(0.02, 0.08, 0.18),
+            envelope: EnvelopeConfig {
+                attack_ms: 6.0,
+                release_ms: 110.0,
+            },
+            latency: "low".into(),
+            frame_width: 921,
+            frame_height: 921,
         };
         let s = serde_json::to_string(&welcome).unwrap();
         let back: ServerMessage = serde_json::from_str(&s).unwrap();
@@ -377,10 +416,12 @@ mod tests {
             ServerMessage::Welcome {
                 catalog,
                 default_emotion,
+                frame_width,
                 ..
             } => {
                 assert_eq!(catalog.base, vec!["base/body.png".to_string()]);
                 assert_eq!(default_emotion, "default");
+                assert_eq!(frame_width, 921);
             }
             _ => panic!("wrong variant"),
         }

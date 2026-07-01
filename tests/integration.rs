@@ -7,12 +7,41 @@ use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc, RwLock};
 use tokio_tungstenite::connect_async;
 
+/// Read the next TEXT JSON message from the socket, skipping the binary RGBA
+/// avatar frames the server interleaves with its control messages.
+async fn next_json(
+    socket: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+) -> serde_json::Value {
+    loop {
+        match socket.next().await {
+            Some(Ok(m)) => {
+                if let Ok(t) = m.into_text() {
+                    if let Ok(v) = serde_json::from_str(&t) {
+                        return v;
+                    }
+                }
+                // binary frame or non-JSON text — skip
+            }
+            other => panic!("stream ended unexpectedly: {other:?}"),
+        }
+    }
+}
+
 /// Spawn the router on an ephemeral port (no audio) against the real catalog.
 async fn spawn_server() -> String {
     let cfg = config::AppConfig::from_path(std::path::Path::new("config.toml"))
         .unwrap();
     let catalog =
         Arc::new(assets::AssetCatalog::load(&cfg.engine.asset_root).unwrap());
+    let compositor = Arc::new(
+        rusty_tuber::compositor::Compositor::new(
+            catalog.clone(),
+            &cfg.engine.asset_root,
+        )
+        .unwrap(),
+    );
     let mouth_config = cfg.thresholds.to_mouth_config().unwrap();
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     let (bcast_tx, _) = broadcast::channel(256);
@@ -21,14 +50,28 @@ async fn spawn_server() -> String {
     } else {
         String::new()
     };
+    let init = compositor.render(
+        if default_emotion.is_empty() {
+            None
+        } else {
+            Some(&default_emotion)
+        },
+        rusty_tuber::protocol::MouthState::Closed,
+        rusty_tuber::protocol::EyeState::Open,
+    );
+    let (frame_tx, _) = tokio::sync::watch::channel(std::sync::Arc::new(init));
+    let envelope = rusty_tuber::audio::EnvelopeControl::new(6.0, 110.0);
     let _state = state::spawn(
         catalog.clone(),
+        compositor,
         mouth_config.clone(),
+        envelope,
         cfg.timers.clone(),
         default_emotion.clone(),
         cmd_tx.clone(),
         cmd_rx,
         bcast_tx.clone(),
+        frame_tx.clone(),
     );
     let app_state = Arc::new(net::AppState::new(
         catalog.clone(),
@@ -37,6 +80,13 @@ async fn spawn_server() -> String {
         bcast_tx.clone(),
         Arc::new(RwLock::new(None)),
         Arc::new(RwLock::new(mouth_config)),
+        Arc::new(RwLock::new(rusty_tuber::protocol::EnvelopeConfig {
+            attack_ms: 6.0,
+            release_ms: 110.0,
+        })),
+        "low".into(),
+        921,
+        921,
     ));
     let _rec = net::spawn_snapshot_recorder(app_state.clone());
     let app = net::build_router(app_state, &cfg.engine.asset_root);
@@ -209,10 +259,7 @@ async fn ws_welcome_carries_layered_catalog() {
     let ws_url = base.replacen("http://", "ws://", 1) + "/ws";
     let (mut socket, _) = connect_async(&ws_url).await.unwrap();
 
-    let welcome = serde_json::from_str::<serde_json::Value>(
-        &socket.next().await.unwrap().unwrap().into_text().unwrap(),
-    )
-    .unwrap();
+    let welcome = next_json(&mut socket).await;
     assert_eq!(welcome["type"].as_str(), Some("Welcome"));
     assert!(
         welcome["payload"]["catalog"]["base"].is_array(),
@@ -237,10 +284,7 @@ async fn ws_mouth_override_emits_layered_state_update() {
 
     let mut saw_open = false;
     for _ in 0..20 {
-        let msg = serde_json::from_str::<serde_json::Value>(
-            &socket.next().await.unwrap().unwrap().into_text().unwrap(),
-        )
-        .unwrap();
+        let msg = next_json(&mut socket).await;
         if msg["type"].as_str() == Some("StateUpdate")
             && msg["payload"]["mouth"].as_str() == Some("open")
         {
@@ -271,10 +315,7 @@ async fn ws_eyes_override_emits_layered_state_update() {
 
     let mut saw_closed = false;
     for _ in 0..20 {
-        let msg = serde_json::from_str::<serde_json::Value>(
-            &socket.next().await.unwrap().unwrap().into_text().unwrap(),
-        )
-        .unwrap();
+        let msg = next_json(&mut socket).await;
         if msg["type"].as_str() == Some("StateUpdate")
             && msg["payload"]["eyes"].as_str() == Some("closed")
         {

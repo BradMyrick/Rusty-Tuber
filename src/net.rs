@@ -12,8 +12,8 @@
 
 use crate::assets::AssetCatalog;
 use crate::protocol::{
-    AvatarSnapshot, ClientMessage, EyeState, MouthConfig, MouthState,
-    ServerMessage,
+    AvatarSnapshot, ClientMessage, EnvelopeConfig, EyeState, MouthConfig,
+    MouthState, ServerMessage,
 };
 use crate::state::StateCommand;
 use axum::extract::ws::{Message, WebSocket};
@@ -53,12 +53,21 @@ pub struct AppState {
     /// Latest mouth-level configuration (enablement + thresholds), mirrored
     /// from the state task for `GET /api/mouth-config` and the WS `Welcome`.
     pub mouth_config: Arc<RwLock<MouthConfig>>,
+    /// Latest audio envelope (attack/release), mirrored for `GET /api/envelope`
+    /// and `Welcome`.
+    pub envelope: Arc<RwLock<EnvelopeConfig>>,
+    /// Audio latency preset in use ("low" / "stable") — surfaced in `Welcome`.
+    pub latency: String,
+    /// Composited frame dimensions — surfaced in `Welcome` for info.
+    pub frame_width: u32,
+    pub frame_height: u32,
     /// Limits concurrent WebSocket clients to [`MAX_WS_CLIENTS`].
     pub ws_permits: Arc<Semaphore>,
 }
 
 impl AppState {
     /// Construct shared state with the default WebSocket concurrency cap.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         catalog: Arc<AssetCatalog>,
         default_emotion: String,
@@ -66,6 +75,10 @@ impl AppState {
         bcast_tx: broadcast::Sender<ServerMessage>,
         snapshot: Arc<RwLock<Option<AvatarSnapshot>>>,
         mouth_config: Arc<RwLock<MouthConfig>>,
+        envelope: Arc<RwLock<EnvelopeConfig>>,
+        latency: String,
+        frame_width: u32,
+        frame_height: u32,
     ) -> Self {
         Self {
             catalog,
@@ -74,6 +87,10 @@ impl AppState {
             bcast_tx,
             snapshot,
             mouth_config,
+            envelope,
+            latency,
+            frame_width,
+            frame_height,
             ws_permits: Arc::new(Semaphore::new(MAX_WS_CLIENTS)),
         }
     }
@@ -108,6 +125,7 @@ pub fn spawn_snapshot_recorder(state: Arc<AppState>) -> JoinHandle<()> {
     let mut rx = state.bcast_tx.subscribe();
     let snapshot = state.snapshot.clone();
     let mouth_config = state.mouth_config.clone();
+    let envelope = state.envelope.clone();
     tokio::spawn(async move {
         loop {
             match rx.recv().await {
@@ -138,6 +156,9 @@ pub fn spawn_snapshot_recorder(state: Arc<AppState>) -> JoinHandle<()> {
                 }
                 Ok(ServerMessage::MouthConfigUpdate { config }) => {
                     *mouth_config.write().await = config;
+                }
+                Ok(ServerMessage::EnvelopeUpdate { config }) => {
+                    *envelope.write().await = config;
                 }
                 Ok(_) => {}
                 Err(broadcast::error::RecvError::Lagged(n)) => {
@@ -196,6 +217,7 @@ fn api_router() -> Router<Arc<AppState>> {
             "/mouth-config",
             get(api_get_mouth_config).post(api_set_mouth_config),
         )
+        .route("/envelope", get(api_get_envelope).post(api_set_envelope))
         .route("/emotion/:name", post(api_trigger_emotion))
         .route("/clear", post(api_clear))
         .route("/default/:name", post(api_set_default))
@@ -287,6 +309,21 @@ async fn api_set_mouth_config(
         return api_error(StatusCode::BAD_REQUEST, msg);
     }
     let _ = st.cmd_tx.send(StateCommand::SetMouthConfig(config));
+    StatusCode::NO_CONTENT.into_response()
+}
+
+async fn api_get_envelope(State(st): State<Arc<AppState>>) -> Response {
+    Json(st.envelope.read().await.clone()).into_response()
+}
+
+async fn api_set_envelope(
+    State(st): State<Arc<AppState>>,
+    Json(config): Json<EnvelopeConfig>,
+) -> Response {
+    if let Err(msg) = config.validate() {
+        return api_error(StatusCode::BAD_REQUEST, msg);
+    }
+    let _ = st.cmd_tx.send(StateCommand::SetEnvelope(config));
     StatusCode::NO_CONTENT.into_response()
 }
 
@@ -444,10 +481,16 @@ async fn handle_ws(socket: WebSocket, st: Arc<AppState>) {
     let (mut sink, mut stream) = socket.split();
     let mut rx = st.bcast_tx.subscribe();
 
+    // The video is NOT on this socket — the browser reads the virtual webcam
+    // directly (getUserMedia). This WS carries only control + meter + config.
     let welcome = ServerMessage::Welcome {
         catalog: st.catalog.catalog().clone(),
         default_emotion: default_or_snapshot(&st).await,
         mouth_config: st.mouth_config.read().await.clone(),
+        envelope: st.envelope.read().await.clone(),
+        latency: st.latency.clone(),
+        frame_width: st.frame_width,
+        frame_height: st.frame_height,
     };
     if send_server_message(&mut sink, &welcome).await.is_err() {
         return;
@@ -459,7 +502,6 @@ async fn handle_ws(socket: WebSocket, st: Arc<AppState>) {
                 match incoming {
                     Some(Ok(Message::Text(text))) => handle_client_text(&st, &text, &mut sink).await,
                     Some(Ok(Message::Binary(b))) => {
-                        // Tolerate clients that send binary-encoded JSON.
                         if let Ok(text) = std::str::from_utf8(&b) {
                             handle_client_text(&st, text, &mut sink).await;
                         }
@@ -555,6 +597,13 @@ async fn handle_client_text(
                 reply_error(sink, &msg).await;
             } else {
                 let _ = st.cmd_tx.send(StateCommand::SetMouthConfig(config));
+            }
+        }
+        Ok(ClientMessage::SetEnvelope { config }) => {
+            if let Err(msg) = config.validate() {
+                reply_error(sink, &msg).await;
+            } else {
+                let _ = st.cmd_tx.send(StateCommand::SetEnvelope(config));
             }
         }
         Ok(ClientMessage::SetEyesOverride { eyes }) => {

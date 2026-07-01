@@ -16,14 +16,18 @@
 //! the catalog and sends them in every `StateUpdate`; the body never changes.
 
 use crate::assets::AssetCatalog;
+use crate::audio::EnvelopeControl;
+use crate::compositor::{Compositor, Frame};
 use crate::config::BlinkSettings;
-use crate::protocol::{EyeState, MouthConfig, MouthState, ServerMessage};
+use crate::protocol::{
+    EnvelopeConfig, EyeState, MouthConfig, MouthState, ServerMessage,
+};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, watch};
 use tokio::task::JoinHandle;
 use tracing::{debug, trace};
 
@@ -48,6 +52,10 @@ pub enum StateCommand {
     ClearMouthOverride,
     /// Client updated the mouth-level configuration (enabled + thresholds).
     SetMouthConfig(MouthConfig),
+    /// Client updated the audio envelope (attack/release). Writes the shared
+    /// atomics the realtime callback reads — applies to the live stream without
+    /// a restart.
+    SetEnvelope(EnvelopeConfig),
     /// Internal: the blink scheduler closed the eyes.
     BlinkClose,
     /// Internal: the blink scheduler opened the eyes.
@@ -104,16 +112,21 @@ pub fn volume_to_mouth(v: f32, cfg: &MouthConfig) -> MouthState {
 #[allow(clippy::too_many_arguments)]
 pub fn spawn(
     catalog: Arc<AssetCatalog>,
+    compositor: Arc<Compositor>,
     mouth_config: MouthConfig,
+    envelope: EnvelopeControl,
     timers: HashMap<String, f32>,
     default_emotion: String,
     cmd_tx: mpsc::UnboundedSender<StateCommand>,
     mut cmd_rx: mpsc::UnboundedReceiver<StateCommand>,
     bcast: broadcast::Sender<ServerMessage>,
+    frame_tx: watch::Sender<Arc<Frame>>,
 ) -> JoinHandle<()> {
     let mut machine = StateMachine {
         catalog,
+        compositor,
         mouth_config,
+        envelope,
         timers,
         default_emotion: default_emotion.clone(),
         emotion_override: None,
@@ -125,9 +138,11 @@ pub fn spawn(
         active_token: 0,
         cmd_tx,
         bcast,
+        frame_tx,
         last_sent_emotion: default_emotion,
         last_sent_mouth: MouthState::Closed,
         last_sent_eyes: EyeState::Open,
+        last_frame_keys: (String::new(), String::new()),
         last_vol_broadcast: Instant::now(),
     };
 
@@ -145,7 +160,9 @@ pub fn spawn(
 
 struct StateMachine {
     catalog: Arc<AssetCatalog>,
+    compositor: Arc<Compositor>,
     mouth_config: MouthConfig,
+    envelope: EnvelopeControl,
     timers: HashMap<String, f32>,
     default_emotion: String,
     emotion_override: Option<String>,
@@ -160,9 +177,15 @@ struct StateMachine {
     active_token: u64,
     cmd_tx: mpsc::UnboundedSender<StateCommand>,
     bcast: broadcast::Sender<ServerMessage>,
+    /// Pushes a freshly composited RGBA frame to the output sinks (browser +
+    /// webcam) whenever the visible layers change.
+    frame_tx: watch::Sender<Arc<Frame>>,
     last_sent_emotion: String,
     last_sent_mouth: MouthState,
     last_sent_eyes: EyeState,
+    /// Last (eyes_frame, mouth_frame) we rendered — skips re-compositing when
+    /// only the volume (meter) drifted but the visible frame didn't change.
+    last_frame_keys: (String, String),
     last_vol_broadcast: Instant,
 }
 
@@ -274,6 +297,13 @@ impl StateMachine {
                     .send(ServerMessage::MouthConfigUpdate { config });
                 self.broadcast_now();
             }
+            StateCommand::SetEnvelope(config) => {
+                // Write the shared atomics the realtime callback reads — applies
+                // immediately to the live audio stream — then tell the panels.
+                self.envelope.set(config.attack_ms, config.release_ms);
+                let _ =
+                    self.bcast.send(ServerMessage::EnvelopeUpdate { config });
+            }
             StateCommand::BlinkClose => {
                 // A manual eyes override pauses the scheduler entirely.
                 if self.eyes_override.is_none() {
@@ -348,12 +378,25 @@ impl StateMachine {
             overridden,
             mouth_overridden,
             eyes_overridden,
-            eyes_frame,
-            mouth_frame,
+            eyes_frame: eyes_frame.clone(),
+            mouth_frame: mouth_frame.clone(),
             default_emotion: self.default_emotion.clone(),
         };
         // `send` errors only when there are no receivers; that's fine.
         let _ = self.bcast.send(msg);
+        // Re-composite the avatar only when the visible layers actually
+        // changed (skips volume-only meter drift), then push to sinks.
+        let key = (eyes_frame, mouth_frame);
+        if key != self.last_frame_keys {
+            self.last_frame_keys = key;
+            let emotion_opt = if emotion.is_empty() {
+                None
+            } else {
+                Some(emotion)
+            };
+            let frame = self.compositor.render(emotion_opt, mouth, eyes);
+            let _ = self.frame_tx.send(Arc::new(frame));
+        }
         self.last_sent_emotion = emotion.to_string();
         self.last_sent_mouth = mouth;
         self.last_sent_eyes = eyes;
@@ -406,10 +449,39 @@ pub fn spawn_blink_scheduler(
 mod tests {
     use super::*;
     use crate::protocol::{EyeLayers, LayerCatalog, MouthLayers};
+    use image::RgbaImage;
     use std::collections::BTreeMap;
+    use std::fs;
 
-    fn fake_catalog() -> AssetCatalog {
-        AssetCatalog(LayerCatalog {
+    // Build a real on-disk layered catalog + compositor (the compositor decodes
+    // actual PNGs), so the state task can render frames in tests.
+    fn setup() -> (AssetCatalog, std::path::PathBuf) {
+        let root = std::env::temp_dir().join(format!(
+            "rt-state-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let touch = |rel: &str, rgba: &[u8]| {
+            let p = root.join(rel);
+            fs::create_dir_all(p.parent().unwrap()).unwrap();
+            let img: RgbaImage =
+                RgbaImage::from_raw(2, 2, rgba.to_vec()).unwrap();
+            img.save(&p).unwrap();
+        };
+        touch("base/body.png", &[200, 0, 0, 255].repeat(4));
+        for m in ["closed", "partial", "medium", "open"] {
+            touch(&format!("mouths/{m}.png"), &[0, 255, 0, 255].repeat(4));
+        }
+        touch("eyes/open.png", &[255, 255, 255, 255].repeat(4));
+        touch("eyes/closed.png", &[0, 0, 0, 255].repeat(4));
+        touch("eyes/surprised/open.png", &[255, 0, 255, 255].repeat(4));
+        touch("eyes/surprised/closed.png", &[0, 255, 255, 255].repeat(4));
+        touch("eyes/flat/open.png", &[120, 120, 120, 255].repeat(4));
+
+        let cat = AssetCatalog(LayerCatalog {
             base: vec!["base/body.png".into()],
             mouths: MouthLayers {
                 closed: Some("mouths/closed.png".into()),
@@ -423,7 +495,6 @@ mod tests {
             },
             emotions: {
                 let mut m = BTreeMap::new();
-                // surprised: eyes only (open + closed blink)
                 m.insert(
                     "surprised".into(),
                     EyeLayers {
@@ -431,7 +502,6 @@ mod tests {
                         closed: Some("eyes/surprised/closed.png".into()),
                     },
                 );
-                // flat: open only (no blink)
                 m.insert(
                     "flat".into(),
                     EyeLayers {
@@ -441,7 +511,8 @@ mod tests {
                 );
                 m
             },
-        })
+        });
+        (cat, root)
     }
 
     fn mouth_config() -> MouthConfig {
@@ -453,19 +524,27 @@ mod tests {
         broadcast::Receiver<ServerMessage>,
         JoinHandle<()>,
     ) {
-        let catalog = Arc::new(fake_catalog());
+        let (cat, root) = setup();
+        let catalog = Arc::new(cat);
+        let compositor =
+            Arc::new(Compositor::new(catalog.clone(), &root).unwrap());
         let mut timers = HashMap::new();
         timers.insert("surprised".into(), 0.1_f32); // short for tests
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         let (bcast_tx, bcast_rx) = broadcast::channel(64);
+        let init = compositor.render(None, MouthState::Closed, EyeState::Open);
+        let (frame_tx, _frame_rx) = watch::channel(Arc::new(init));
         let handle = spawn(
             catalog,
+            compositor,
             mouth_config(),
+            crate::audio::EnvelopeControl::new(6.0, 110.0),
             timers,
             String::new(), // no resting emotion -> default eyes
             cmd_tx.clone(),
             cmd_rx,
             bcast_tx,
+            frame_tx,
         );
         (cmd_tx, bcast_rx, handle)
     }

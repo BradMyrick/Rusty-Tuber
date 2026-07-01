@@ -5,10 +5,13 @@
 
 pub mod assets;
 pub mod audio;
+pub mod compositor;
 pub mod config;
 pub mod net;
 pub mod protocol;
 pub mod state;
+#[cfg(target_os = "linux")]
+pub mod webcam;
 
 use anyhow::{Context, Result};
 use std::sync::Arc;
@@ -45,24 +48,52 @@ pub async fn run(cfg: config::AppConfig) -> Result<()> {
 
     // --- Channels & state task ---------------------------------------------
     let mouth_config = cfg.thresholds.to_mouth_config()?;
+    let envelope =
+        audio::EnvelopeControl::new(cfg.audio.attack_ms, cfg.audio.release_ms);
+    let compositor = Arc::new(compositor::Compositor::new(
+        catalog.clone(),
+        &cfg.engine.asset_root,
+    )?);
+    let (cw, ch) = compositor.dimensions();
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<state::StateCommand>();
     let (bcast_tx, _) = broadcast::channel::<protocol::ServerMessage>(256);
 
+    // The compositor's frame is the universal source of truth. The webcam is
+    // the SINGLE video output; the browser reads it back as a normal camera
+    // (getUserMedia), so we don't stream frames over WebSocket — one render,
+    // one consumer, no duplicated work.
+    let init_frame = compositor.render(
+        if default_emotion.is_empty() {
+            None
+        } else {
+            Some(&default_emotion)
+        },
+        protocol::MouthState::Closed,
+        protocol::EyeState::Open,
+    );
+    let (frame_tx, _) =
+        tokio::sync::watch::channel(std::sync::Arc::new(init_frame));
+    #[cfg(target_os = "linux")]
+    let webcam_rx = frame_tx.subscribe();
+
     let state_handle = state::spawn(
         catalog.clone(),
+        compositor.clone(),
         mouth_config.clone(),
+        envelope.clone(),
         cfg.timers.clone(),
         default_emotion.clone(),
         cmd_tx.clone(),
         cmd_rx,
         bcast_tx.clone(),
+        frame_tx,
     );
 
     // Eye-blink scheduler: posts BlinkClose/BlinkOpen at randomised intervals
     // until the command channel closes on shutdown.
     state::spawn_blink_scheduler(cmd_tx.clone(), cfg.blink.clone());
 
-    // --- Shared HTTP/WS state ----------------------------------------------
+    // --- Shared HTTP/WS state (control only — no video over WS) -------------
     let app_state = Arc::new(net::AppState::new(
         catalog.clone(),
         default_emotion,
@@ -70,22 +101,57 @@ pub async fn run(cfg: config::AppConfig) -> Result<()> {
         bcast_tx.clone(),
         Arc::new(RwLock::new(None)),
         Arc::new(RwLock::new(mouth_config)),
+        Arc::new(RwLock::new(protocol::EnvelopeConfig {
+            attack_ms: cfg.audio.attack_ms,
+            release_ms: cfg.audio.release_ms,
+        })),
+        format!("{:?}", cfg.audio.latency).to_ascii_lowercase(),
+        cw,
+        ch,
     ));
     let _recorder = net::spawn_snapshot_recorder(app_state.clone());
+    #[cfg(target_os = "linux")]
+    if cfg.webcam.enabled {
+        match (webcam::find_device(&cfg.webcam.device), cfg.webcam.background_rgb()) {
+            (Some(dev), Ok(bg)) => {
+                if let Err(e) = webcam::spawn_webcam(
+                    webcam_rx,
+                    dev.clone(),
+                    cfg.webcam.fps,
+                    cfg.webcam.idle_fps,
+                    bg,
+                ) {
+                    warn!(error = %format!("{e:#}"), "webcam output disabled");
+                }
+            }
+            (None, _) => warn!(
+                "no v4l2loopback device found; webcam disabled. \
+                 install/enable with: sudo apt install v4l2loopback-dkms && sudo modprobe v4l2loopback"
+            ),
+            (_, Err(e)) => warn!(error = %format!("{e:#}"), "webcam disabled (bad config)"),
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    if cfg.webcam.enabled {
+        warn!("webcam output is only supported on Linux; ignoring [webcam].enabled");
+    }
 
     // --- Audio capture (dedicated OS thread; cpal Stream lives there) -------
     let audio_cfg = cfg.audio.clone();
     let audio_cmd_tx = cmd_tx.clone();
-    std::thread::spawn(move || match audio::start(&audio_cfg, audio_cmd_tx) {
-        Ok(_stream) => {
-            info!("audio capture running");
-            // Hold the stream alive for the lifetime of the process.
-            std::thread::park();
+    let audio_env = envelope.clone();
+    std::thread::spawn(move || {
+        match audio::start(&audio_cfg, audio_env, audio_cmd_tx) {
+            Ok(_stream) => {
+                info!("audio capture running");
+                // Hold the stream alive for the lifetime of the process.
+                std::thread::park();
+            }
+            Err(e) => error!(
+                error = %format!("{e:#}"),
+                "audio capture failed; server will continue (use the web app to drive the avatar manually)"
+            ),
         }
-        Err(e) => error!(
-            error = %format!("{e:#}"),
-            "audio capture failed; server will continue (use the web app to drive the avatar manually)"
-        ),
     });
 
     // --- HTTP / WS server --------------------------------------------------

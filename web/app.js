@@ -1,20 +1,14 @@
-// Rusty-Tuber web client. Shared by the control panel (index.html) and the
-// OBS stage (stage.html). Connects to the server WebSocket, preloads every
-// layer for instant swaps, renders the emotion/mouth buttons (panel only), and
-// keeps the displayed avatar in sync with authoritative StateUpdate messages.
-//
-// The avatar is a stack of transparent PNG layers (all the same canvas size):
-//   base   — one or more static body images (rendered bottom-up, never change)
-//   eyes   — the eye layer; swaps on blink and on emotion (eye-expression) change
-//   mouth  — the mouth layer; swaps with mic volume
-// Only the eye and mouth layers ever swap; the body stays put.
+// Rusty-Tuber web client (control panel). The Rust server composites the avatar
+// and writes it to a virtual webcam (v4l2loopback) — the SINGLE video output.
+// This panel reads that webcam back like any camera app (getUserMedia) for a
+// preview, and uses a text WebSocket only for control + the volume meter +
+// config (mouth levels, audio envelope). All avatar logic lives in Rust.
 
 const mode = document.body.dataset.mode;
 const isPanel = mode === "panel";
 
-const stageWrap = document.getElementById("stage-wrap");
-const layerEyes = document.getElementById("layer-eyes");
-const layerMouth = document.getElementById("layer-mouth");
+const previewVideo = document.getElementById("preview-video");
+const previewBtn = document.getElementById("preview-btn");
 
 const els = isPanel
   ? {
@@ -33,68 +27,58 @@ const els = isPanel
       tuning: document.getElementById("tuning"),
       mouthLevels: document.getElementById("mouth-levels"),
       thresholds: document.getElementById("thresholds"),
+      envelope: document.getElementById("envelope"),
+      latencyMode: document.getElementById("latency-mode"),
     }
   : null;
 
 let state = {
-  catalog: null,      // layered catalog: { base, mouths, default_eyes, emotions }
+  catalog: null, // { base, mouths, default_eyes, emotions }
   defaultEmotion: "",
   emotion: "",
   mouth: "closed",
   eyes: "open",
   overridden: false,
-  // Authoritative override flags come from the server so every client (panel,
-  // OBS, phone) agrees even when a Stream Deck issues overrides via REST.
   mouthOverridden: false,
   eyesOverridden: false,
-  // Mouth-level config: which levels are active + pick-up thresholds. Drives
-  // the tuning card and is pushed back to the server on change.
+  // Mouth-level config (active levels + thresholds) + audio envelope, mirrored
+  // from the server and pushed back on change.
   mouthConfig: { enabled: [true, true, true, true], partial: 0.02, medium: 0.08, open: 0.18 },
+  envelope: { attack_ms: 6, release_ms: 110 },
 };
 
-const cache = new Map(); // frame URL -> HTMLImageElement (preloaded)
 let toastTimer = null;
+const MOUTH_KEYS = ["closed", "partial", "medium", "open"];
 
 function wsUrl() {
   const proto = location.protocol === "https:" ? "wss:" : "ws:";
   return `${proto}//${location.host}/ws`;
 }
 
-const MOUTH_KEYS = ["closed", "partial", "medium", "open"];
-
-// Preload every layer PNG so swaps are instant and flicker-free. Covers the
-// base body, all mouth levels, and every eye frame (default + each emotion's
-// open/closed set).
-function preloadAll(catalog) {
-  const want = (rel) => {
-    if (!rel) return;
-    const url = `/frames/${rel}`;
-    if (cache.has(url)) return;
-    const img = new Image();
-    img.src = url;
-    cache.set(url, img);
-  };
-  for (const rel of catalog.base || []) want(rel);
-  for (const rel of Object.values(catalog.mouths || {})) want(rel);
-  want((catalog.default_eyes || {}).open);
-  want((catalog.default_eyes || {}).closed);
-  for (const set of Object.values(catalog.emotions || {})) {
-    want(set.open);
-    want(set.closed);
+// --- Webcam preview: read the virtual camera back via getUserMedia ---------
+// The avatar is already on the v4l2loopback device; we just display it here.
+// Camera access needs a user gesture + permission, hence the button.
+async function enablePreview() {
+  if (!navigator.mediaDevices?.getUserMedia) {
+    showToast("Camera API unavailable (needs HTTPS or localhost).");
+    return;
   }
-}
-
-// Build the static base layer(s) under the eye/mouth layers. Called on
-// (re)connect when the catalog arrives; the body never changes after this.
-function renderBaseLayers(catalog) {
-  if (!stageWrap || !layerEyes) return;
-  for (const el of stageWrap.querySelectorAll("img.layer-base")) el.remove();
-  for (const rel of catalog.base || []) {
-    const img = document.createElement("img");
-    img.className = "layer layer-base";
-    img.alt = "";
-    img.src = `/frames/${rel}`;
-    stageWrap.insertBefore(img, layerEyes); // keep base below eyes/mouth
+  try {
+    // A first getUserMedia to obtain permission (device labels need it).
+    let stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+    stream.getTracks().forEach((t) => t.stop());
+    // Prefer the "Rusty-Tuber" device if present, else the first camera.
+    const devs = await navigator.mediaDevices.enumerateDevices();
+    const cams = devs.filter((d) => d.kind === "videoinput");
+    const pick = cams.find((d) => (d.label || "").includes("Rusty-Tuber")) || cams[0];
+    stream = await navigator.mediaDevices.getUserMedia({
+      video: pick ? { deviceId: { exact: pick.deviceId } } : true,
+      audio: false,
+    });
+    previewVideo.srcObject = stream;
+    previewBtn.hidden = true;
+  } catch (e) {
+    showToast("Preview failed: " + (e?.message || e));
   }
 }
 
@@ -116,30 +100,76 @@ const setEyes = (e) => send({ type: "SetEyesOverride", payload: { eyes: e } });
 const clearEyes = () => send({ type: "ClearEyesOverride" });
 
 // --- Mouth tuning (levels + thresholds) -----------------------------------
-// `enabled` is indexed by MOUTH_KEYS: [closed, partial, medium, open]. The
-// lowest enabled level is the resting mouth. Thresholds are stored as 0..1 and
-// shown as percent; strict order partial<medium<open is enforced live by
-// clamping each slider within its neighbours, so two can never be equal.
+// All three sliders share a 0–100 scale; dragging one carries its neighbours so
+// partial<medium<open always holds (two can never be equal) and thumbs never
+// rescale away from the pointer.
 let mouthConfigTimer = null;
 
-function setMouthConfig(cfg) {
-  send({ type: "SetMouthConfig", payload: { config: cfg } });
-}
-
-// Debounce so dragging a slider doesn't flood the server.
 function scheduleSetMouthConfig() {
   if (mouthConfigTimer) clearTimeout(mouthConfigTimer);
   mouthConfigTimer = setTimeout(() => {
     mouthConfigTimer = null;
-    setMouthConfig(state.mouthConfig);
-  }, 150);
+    send({ type: "SetMouthConfig", payload: { config: state.mouthConfig } });
+  }, 120);
+}
+
+// --- Audio envelope (attack/release) sliders -------------------------------
+let envelopeTimer = null;
+function scheduleSetEnvelope() {
+  if (envelopeTimer) clearTimeout(envelopeTimer);
+  envelopeTimer = setTimeout(() => {
+    envelopeTimer = null;
+    send({ type: "SetEnvelope", payload: { config: state.envelope } });
+  }, 120);
+}
+
+function renderEnvelope() {
+  if (!isPanel) return;
+  els.envelope.innerHTML = "";
+  const add = (key, label, min, max, step) => {
+    const row = document.createElement("div");
+    row.className = "threshold";
+    const lab = document.createElement("span");
+    lab.textContent = label;
+    const range = document.createElement("input");
+    range.type = "range";
+    range.min = String(min);
+    range.max = String(max);
+    range.step = String(step);
+    const val = document.createElement("span");
+    val.className = "tv";
+    row.appendChild(lab);
+    row.appendChild(range);
+    row.appendChild(val);
+    els.envelope.appendChild(row);
+    const update = () => {
+      const v = Number(range.value);
+      state.envelope[key] = v;
+      val.textContent = v + " ms";
+    };
+    range.addEventListener("input", () => { update(); scheduleSetEnvelope(); });
+    range.value = String(Math.round(state.envelope[key] || (key === "attack_ms" ? 6 : 110)));
+    update();
+  };
+  add("attack_ms", "attack", 1, 40, 1);
+  add("release_ms", "release", 20, 300, 5);
+}
+
+function currentPct() {
+  const c = state.mouthConfig;
+  return [Math.round(c.partial * 100), Math.round(c.medium * 100), Math.round(c.open * 100)];
+}
+
+function writePct(pp, mm, oo) {
+  const c = state.mouthConfig;
+  c.partial = pp / 100;
+  c.medium = mm / 100;
+  c.open = oo / 100;
 }
 
 function renderTuning() {
   if (!isPanel) return;
   const cfg = state.mouthConfig;
-
-  // Active-level chips with a "resting" marker on the lowest enabled.
   els.mouthLevels.innerHTML = "";
   const lowestOn = cfg.enabled.findIndex((e) => e);
   MOUTH_KEYS.forEach((lvl, i) => {
@@ -154,7 +184,6 @@ function renderTuning() {
     els.mouthLevels.appendChild(chip);
   });
 
-  // Threshold sliders (partial / medium / open).
   els.thresholds.innerHTML = "";
   for (const lvl of ["partial", "medium", "open"]) {
     const row = document.createElement("div");
@@ -177,33 +206,37 @@ function renderTuning() {
   updateThresholdDOM();
 }
 
-// Recompute slider min/max/value/labels from state (keeps them ordered).
 function updateThresholdDOM() {
-  const cfg = state.mouthConfig;
-  const pp = Math.round(cfg.partial * 100);
-  const mm = Math.round(cfg.medium * 100);
-  const oo = Math.round(cfg.open * 100);
+  const [pp, mm, oo] = currentPct();
   const rows = els.thresholds.children;
-  const set = (row, value, min, max) => {
-    const range = row.querySelector("input");
-    range.min = String(min);
-    range.max = String(max);
-    range.value = String(value);
+  const set = (row, value) => {
+    row.querySelector("input").value = String(value);
     row.querySelector(".tv").textContent = value + "%";
   };
-  set(rows[0], pp, 0, mm - 1);          // partial: [0, medium-1]
-  set(rows[1], mm, pp + 1, oo - 1);     // medium:  [partial+1, open-1]
-  set(rows[2], oo, mm + 1, 100);        // open:    [medium+1, 100]
+  set(rows[0], pp);
+  set(rows[1], mm);
+  set(rows[2], oo);
 }
 
 function onThreshold(level, pct) {
-  const cfg = state.mouthConfig;
-  const pp = Math.round(cfg.partial * 100);
-  const mm = Math.round(cfg.medium * 100);
-  const oo = Math.round(cfg.open * 100);
-  if (level === "partial") cfg.partial = clamp(pct, 0, mm - 1) / 100;
-  else if (level === "medium") cfg.medium = clamp(pct, pp + 1, oo - 1) / 100;
-  else cfg.open = clamp(pct, mm + 1, 100) / 100;
+  let [pp, mm, oo] = currentPct();
+  if (level === "partial") {
+    pp = clamp(pct, 0, 98);
+    if (pp >= mm) mm = pp + 1; // push medium up
+    if (mm >= oo) oo = mm + 1; // cascade to open
+  } else if (level === "medium") {
+    mm = clamp(pct, 1, 99);
+    if (mm <= pp) pp = mm - 1; // push partial down
+    if (mm >= oo) oo = mm + 1; // push open up
+  } else {
+    oo = clamp(pct, 2, 100);
+    if (oo <= mm) mm = oo - 1; // push medium down
+    if (mm <= pp) pp = mm - 1; // cascade to partial
+  }
+  pp = clamp(pp, 0, 98);
+  mm = clamp(mm, pp + 1, 99);
+  oo = clamp(oo, mm + 1, 100);
+  writePct(pp, mm, oo);
   updateThresholdDOM();
   scheduleSetMouthConfig();
 }
@@ -228,22 +261,18 @@ function clamp(n, lo, hi) {
 function renderButtons() {
   if (!isPanel) return;
   els.emotions.innerHTML = "";
-  // Emotions come from the catalog's eye-expression sets. With no emotion art
-  // on disk, this is empty and the section renders nothing.
-  const emotions = state.catalog ? Object.keys(state.catalog.emotions || {}).sort() : [];
+  const emotions = state.catalog
+    ? Object.keys(state.catalog.emotions || {}).sort()
+    : [];
   emotions.forEach((e, i) => {
-    // Each emotion is a cell: a trigger button plus a small "set as resting"
-    // star so the resting face can be changed from the UI (not just config).
     const cell = document.createElement("div");
     cell.className = "emotion-cell";
     cell.dataset.key = e;
-
     const b = document.createElement("button");
     b.className = "emotion-btn";
     b.textContent = e;
     b.dataset.key = e;
     b.onclick = () => triggerEmotion(e);
-    // Number-key badge for the first nine emotions.
     if (i < 9) {
       const kbd = document.createElement("kbd");
       kbd.className = "hotkey";
@@ -251,7 +280,6 @@ function renderButtons() {
       b.appendChild(kbd);
     }
     cell.appendChild(b);
-
     const star = document.createElement("button");
     star.className = "star";
     star.title = `Set "${e}" as the resting emotion`;
@@ -263,7 +291,6 @@ function renderButtons() {
       setDefault(e);
     };
     cell.appendChild(star);
-
     els.emotions.appendChild(cell);
   });
   els.clearBtn.onclick = clearOverride;
@@ -293,7 +320,6 @@ function renderButtons() {
     ["medium", "Medium", () => setMouth("medium")],
     ["open", "Open", () => setMouth("open")],
   ]);
-
   buildRow(els.eyes, [
     ["auto", "Auto", clearEyes, "auto", "E"],
     ["open", "Open", () => setEyes("open")],
@@ -308,9 +334,6 @@ function highlight() {
     cell.classList.toggle("is-active", key === state.emotion);
     cell.classList.toggle("is-default", key === state.defaultEmotion);
   }
-  // Mouth/Eyes: highlight Auto when no override is active, else the forced
-  // value. The flags are authoritative from the server, so two clients (panel
-  // + Stream Deck via REST) always agree.
   for (const b of els.mouth.children) {
     const isActive = state.mouthOverridden
       ? b.dataset.key === state.mouth
@@ -333,16 +356,13 @@ function applyState(payload) {
   state.overridden = payload.overridden === true;
   state.mouthOverridden = payload.mouth_overridden === true;
   state.eyesOverridden = payload.eyes_overridden === true;
-  // Only the eye and mouth layers swap; the base body stays put. Dedupe by URL
-  // so identical frames don't trigger a reload (keeps swaps flicker-free).
-  if (layerEyes && payload.eyes_frame && !layerEyes.src.endsWith(payload.eyes_frame)) {
-    layerEyes.src = payload.eyes_frame;
-  }
-  if (layerMouth && payload.mouth_frame && !layerMouth.src.endsWith(payload.mouth_frame)) {
-    layerMouth.src = payload.mouth_frame;
-  }
-  if (layerMouth && payload.emotion !== undefined) {
-    layerMouth.alt = `avatar, ${payload.emotion || "default"}, mouth ${state.mouth}, eyes ${state.eyes}`;
+  // The avatar video comes from the webcam (getUserMedia), not this WS message;
+  // here we only update the UI (meter + control highlighting).
+  if (previewVideo && payload.emotion !== undefined) {
+    previewVideo.setAttribute(
+      "aria-label",
+      `avatar, ${payload.emotion || "default"}, mouth ${state.mouth}, eyes ${state.eyes}`
+    );
   }
   if (isPanel) {
     updateMeter(payload.volume || 0);
@@ -350,8 +370,6 @@ function applyState(payload) {
   }
 }
 
-// Peak-hold meter: the fill tracks the live level; a decaying peak marker
-// remembers the recent maximum and falls back smoothly.
 let meterPeak = 0;
 function updateMeter(volume) {
   const pct = Math.min(100, volume * 100);
@@ -365,9 +383,7 @@ function updateMeter(volume) {
 function setConnected(ok) {
   if (!isPanel) return;
   els.dot.classList.toggle("ok", ok);
-  if (els.connText) {
-    els.connText.textContent = ok ? "connected" : "disconnected";
-  }
+  if (els.connText) els.connText.textContent = ok ? "connected" : "disconnected";
 }
 
 function showToast(message, ms = 4000) {
@@ -383,7 +399,7 @@ let reconnectTimer = null;
 let reconnectAttempts = 0;
 
 function connect() {
-  socket = new WebSocket(wsUrl());
+  socket = new WebSocket(wsUrl()); // text-only: control + meter + config (no video)
 
   socket.onopen = () => {
     reconnectAttempts = 0;
@@ -392,6 +408,8 @@ function connect() {
   };
 
   socket.onmessage = (ev) => {
+    // The video comes from the webcam (getUserMedia), not this socket — so all
+    // WS messages are text JSON control.
     let msg;
     try {
       msg = JSON.parse(ev.data);
@@ -403,10 +421,13 @@ function connect() {
         state.catalog = msg.payload.catalog || null;
         state.defaultEmotion = msg.payload.default_emotion || "";
         if (msg.payload.mouth_config) state.mouthConfig = msg.payload.mouth_config;
-        preloadAll(state.catalog || {});
-        renderBaseLayers(state.catalog || {});
+        if (msg.payload.envelope) state.envelope = msg.payload.envelope;
+        if (els.latencyMode && msg.payload.latency) {
+          els.latencyMode.textContent = msg.payload.latency;
+        }
         renderButtons();
         renderTuning();
+        renderEnvelope();
         highlight();
         break;
       }
@@ -415,10 +436,16 @@ function connect() {
         break;
       }
       case "MouthConfigUpdate": {
-        // Another client (or REST) changed the tuning — sync without echoing.
         if (msg.payload.config) {
           state.mouthConfig = msg.payload.config;
           renderTuning();
+        }
+        break;
+      }
+      case "EnvelopeUpdate": {
+        if (msg.payload.config) {
+          state.envelope = msg.payload.config;
+          renderEnvelope();
         }
         break;
       }
@@ -438,13 +465,11 @@ function connect() {
   };
 }
 
-// Exponential backoff with full jitter, capped at 30s, so a long server outage
-// doesn't hammer thousands of reconnects and the user sees a countdown.
 function scheduleReconnect() {
   if (reconnectTimer) return;
   reconnectAttempts += 1;
   const base = Math.min(30000, 1000 * 2 ** (reconnectAttempts - 1));
-  const delay = base * (0.5 + Math.random() * 0.5); // 50–100% of base
+  const delay = base * (0.5 + Math.random() * 0.5);
   const secs = Math.max(1, Math.round(delay / 1000));
   if (isPanel && els.connText) {
     els.connText.textContent = `reconnecting in ${secs}s…`;
@@ -460,17 +485,13 @@ window.addEventListener("beforeunload", () => {
 });
 
 // --- Keyboard shortcuts (panel only) --------------------------------------
-// 1..9 trigger the first nine emotions, 0 clears the override, M cycles mouth,
-// E cycles eyes, D sets the current emotion as the resting face.
 const MOUTH_CYCLE = ["closed", "partial", "medium", "open"];
-
 function cycleMouth() {
   if (!state.mouthOverridden) return setMouth("closed");
   const idx = MOUTH_CYCLE.indexOf(state.mouth);
   if (idx < 0 || idx >= MOUTH_CYCLE.length - 1) return clearMouth();
   setMouth(MOUTH_CYCLE[idx + 1]);
 }
-
 function cycleEyes() {
   if (!state.eyesOverridden) return setEyes("open");
   if (state.eyes === "open") return setEyes("closed");
@@ -480,35 +501,21 @@ function cycleEyes() {
 if (isPanel) {
   document.addEventListener("keydown", (ev) => {
     const t = ev.target;
-    if (
-      t &&
-      (t.tagName === "INPUT" ||
-        t.tagName === "TEXTAREA" ||
-        t.isContentEditable)
-    ) {
-      return;
-    }
+    if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.isContentEditable)) return;
     if (ev.metaKey || ev.ctrlKey || ev.altKey) return;
-
     if (/^[1-9]$/.test(ev.key)) {
-      const emotions = Object.keys(state.catalog).sort();
+      const emotions = state.catalog
+        ? Object.keys(state.catalog.emotions || {}).sort()
+        : [];
       const pick = emotions[Number(ev.key) - 1];
       if (pick) triggerEmotion(pick);
       return;
     }
     switch (ev.key.toLowerCase()) {
-      case "0":
-        clearOverride();
-        break;
-      case "m":
-        cycleMouth();
-        break;
-      case "e":
-        cycleEyes();
-        break;
-      case "d":
-        if (state.emotion) setDefault(state.emotion);
-        break;
+      case "0": clearOverride(); break;
+      case "m": cycleMouth(); break;
+      case "e": cycleEyes(); break;
+      case "d": if (state.emotion) setDefault(state.emotion); break;
     }
   });
 }
@@ -534,6 +541,9 @@ if (isPanel && els.tuningToggle) {
     els.tuningToggle.textContent = open ? "hide" : "show";
     els.tuningToggle.setAttribute("aria-expanded", String(open));
   };
+}
+if (previewBtn) {
+  previewBtn.onclick = enablePreview;
 }
 
 connect();

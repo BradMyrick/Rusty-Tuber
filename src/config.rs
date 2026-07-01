@@ -22,6 +22,9 @@ pub struct AppConfig {
     /// Eye-blink scheduler tuning.
     #[serde(default)]
     pub blink: BlinkSettings,
+    /// Virtual webcam output (Linux v4l2loopback). Ignored on non-Linux.
+    #[serde(default)]
+    pub webcam: WebcamSettings,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Default, PartialEq, Eq)]
@@ -34,12 +37,43 @@ pub enum AudioMode {
     Loopback,
 }
 
+/// Audio capture latency preset. `low` uses small buffers (~256 frames, ~6 ms
+/// at 44.1 kHz) for snappy mouth response; `stable` uses larger buffers
+/// (~1024, ~23 ms) for setups that glitch at small buffer sizes.
+#[derive(Debug, Clone, Copy, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum LatencyMode {
+    #[default]
+    Low,
+    Stable,
+}
+
+impl LatencyMode {
+    /// Preferred frame count per buffer for this preset.
+    pub fn buffer_size(self) -> u32 {
+        match self {
+            LatencyMode::Low => 256,
+            LatencyMode::Stable => 1024,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct AudioSettings {
     pub sample_rate: u32,
-    pub buffer_size: u32,
-    #[serde(default = "default_smoothing")]
-    pub smoothing_factor: f32,
+    /// Optional explicit buffer size; if omitted, the `latency` preset decides.
+    #[serde(default)]
+    pub buffer_size: Option<u32>,
+    #[serde(default)]
+    pub latency: LatencyMode,
+    /// Envelope attack time constant (ms) — how fast the mouth opens when you
+    /// start talking. Smaller = snappier.
+    #[serde(default = "default_attack_ms")]
+    pub attack_ms: f32,
+    /// Envelope release time constant (ms) — how gently the mouth closes when
+    /// you stop. Larger = smoother, less flutter on quiet syllables.
+    #[serde(default = "default_release_ms")]
+    pub release_ms: f32,
     #[serde(default)]
     pub mode: AudioMode,
     /// Empty string selects the system default device.
@@ -47,8 +81,20 @@ pub struct AudioSettings {
     pub device: String,
 }
 
-fn default_smoothing() -> f32 {
-    0.35
+impl AudioSettings {
+    /// The buffer size actually requested: an explicit override if given,
+    /// otherwise the latency preset's default.
+    pub fn effective_buffer_size(&self) -> u32 {
+        self.buffer_size
+            .unwrap_or_else(|| self.latency.buffer_size())
+    }
+}
+
+fn default_attack_ms() -> f32 {
+    6.0
+}
+fn default_release_ms() -> f32 {
+    110.0
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -149,6 +195,70 @@ impl Default for BlinkSettings {
     }
 }
 
+/// Virtual webcam output (Linux v4l2loopback). The avatar is composited over an
+/// opaque `background` colour (webcams carry no alpha) and written as BGR4. Use
+/// a chroma colour (default green) so consumers can key it out for transparency.
+/// The webcam runs at `fps` while the avatar is moving and drops to `idle_fps`
+/// while static to save CPU.
+#[derive(Debug, Clone, Deserialize)]
+pub struct WebcamSettings {
+    #[serde(default)]
+    pub enabled: bool,
+    /// `/dev/videoN` path; empty = auto-detect the first v4l2loopback device.
+    #[serde(default)]
+    pub device: String,
+    /// Active frame rate while the avatar is moving (talking/blink/emotion).
+    #[serde(default = "default_fps")]
+    pub fps: u32,
+    /// Idle frame rate while the avatar is static (keeps the feed alive for
+    /// consumers without burning CPU at the full rate).
+    #[serde(default = "default_idle_fps")]
+    pub idle_fps: u32,
+    /// Hex colour (e.g. `#00ff00`) used to fill transparent areas. Default green
+    /// for chroma keying.
+    #[serde(default = "default_background")]
+    pub background: String,
+}
+
+fn default_fps() -> u32 {
+    30
+}
+fn default_idle_fps() -> u32 {
+    8
+}
+fn default_background() -> String {
+    "#00ff00".into()
+}
+
+impl Default for WebcamSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            device: String::new(),
+            fps: 30,
+            idle_fps: 8,
+            background: "#00ff00".into(),
+        }
+    }
+}
+
+impl WebcamSettings {
+    /// Parse `background` (a CSS-style `#rrggbb` hex string) into RGB.
+    pub fn background_rgb(&self) -> Result<[u8; 3]> {
+        let hex = self.background.trim_start_matches('#');
+        if hex.len() != 6 {
+            anyhow::bail!(
+                "[webcam].background must be #rrggbb (got {:?})",
+                self.background
+            );
+        }
+        let r = u8::from_str_radix(&hex[0..2], 16)?;
+        let g = u8::from_str_radix(&hex[2..4], 16)?;
+        let b = u8::from_str_radix(&hex[4..6], 16)?;
+        Ok([r, g, b])
+    }
+}
+
 impl AppConfig {
     /// Parse a TOML string into validated configuration.
     pub fn from_toml_str(raw: &str) -> Result<Self> {
@@ -189,19 +299,18 @@ impl AppConfig {
             }
         }
 
-        if !self.audio.smoothing_factor.is_finite()
-            || !(0.0..=1.0).contains(&self.audio.smoothing_factor)
-        {
-            bail!(
-                "[audio].smoothing_factor must be in [0.0, 1.0] (got {})",
-                self.audio.smoothing_factor
-            );
+        for ms in [self.audio.attack_ms, self.audio.release_ms] {
+            if !ms.is_finite() || !(0.1..=2000.0).contains(&ms) {
+                bail!(
+                    "[audio] attack_ms/release_ms must be finite and in [0.1, 2000] ms (got {ms})"
+                );
+            }
         }
 
         if self.audio.sample_rate == 0 {
             bail!("[audio].sample_rate must be non-zero");
         }
-        if self.audio.buffer_size == 0 {
+        if self.audio.effective_buffer_size() == 0 {
             bail!("[audio].buffer_size must be non-zero");
         }
 
@@ -240,9 +349,9 @@ mod tests {
     const MINIMAL: &str = r#"
 [audio]
 sample_rate = 44100
-buffer_size = 1024
+latency = "low"
 
-  [thresholds]
+[thresholds]
 partial = 0.02
 medium = 0.08
 open = 0.18
@@ -258,6 +367,9 @@ bind = "127.0.0.1:8080"
         let cfg = AppConfig::from_toml_str(MINIMAL).expect("valid config");
         assert_eq!(cfg.engine.default_emotion, "calm");
         assert_eq!(cfg.audio.mode, AudioMode::Input);
+        assert_eq!(cfg.audio.latency, LatencyMode::Low);
+        assert_eq!(cfg.audio.effective_buffer_size(), 256);
+        assert!((cfg.audio.attack_ms - 6.0).abs() < 1e-6); // default applied
         assert!(cfg.audio.device.is_empty());
         assert!(cfg.timers.is_empty()); // default empty
     }
@@ -271,11 +383,10 @@ bind = "127.0.0.1:8080"
     }
 
     #[test]
-    fn rejects_bad_smoothing() {
-        let raw =
-            MINIMAL.replacen("[audio]", "[audio]\nsmoothing_factor = 3.0", 1);
+    fn rejects_bad_envelope() {
+        let raw = MINIMAL.replacen("[audio]", "[audio]\nattack_ms = 0.0", 1);
         let err = AppConfig::from_toml_str(&raw).unwrap_err();
-        assert!(format!("{err:#}").contains("smoothing_factor"));
+        assert!(format!("{err:#}").contains("attack_ms"));
     }
 
     #[test]
@@ -290,8 +401,9 @@ bind = "127.0.0.1:8080"
         let raw = r#"
 [audio]
 sample_rate = 48000
-buffer_size = 512
-smoothing_factor = 0.5
+latency = "stable"
+attack_ms = 4.0
+release_ms = 90.0
 mode = "loopback"
 device = "alsa_output.pci-0000_00_1b.0.analog-stereo.monitor"
 
@@ -311,6 +423,8 @@ surprised = 2.5
         let cfg = AppConfig::from_toml_str(raw).expect("valid");
         assert_eq!(cfg.audio.mode, AudioMode::Loopback);
         assert_eq!(cfg.audio.sample_rate, 48000);
+        assert_eq!(cfg.audio.latency, LatencyMode::Stable);
+        assert_eq!(cfg.audio.effective_buffer_size(), 1024);
         assert_eq!(cfg.engine.bind, "0.0.0.0:9000");
         assert_eq!(cfg.timers.get("surprised"), Some(&2.5_f32));
     }

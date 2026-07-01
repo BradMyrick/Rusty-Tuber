@@ -2,11 +2,19 @@
 
 A high-performance **PNG-Tuber** written in Rust. Drive a layered PNG avatar
 from your microphone volume and trigger eye-expression emotions from a built-in
-web app, composited into **OBS** as a transparent Browser Source.
+web app. A Rust **compositor** renders every frame and feeds two universal
+outputs: a transparent OBS Browser Source **and** a virtual webcam.
 
+- **Universal Rust backend**: the server composites the avatar (static body +
+  eye layer + mouth layer) into one RGBA frame on every visible change. The web
+  frontend is a dumb canvas display; a virtual webcam sink consumes the same
+  frame. One backend, many outputs.
+- **Buttery-smooth motion**: frames are pushed only on visible change (a few
+  times/sec while talking) and the browser does a single `drawImage` of an
+  already-complete PNG — no per-swap decode or `<img>` churn, so fast talking
+  never stutters.
 - **Layered compositing**: the avatar is a static body plus independent eye and
-  mouth layers (same canvas, stacked like a South-Park cutout). Only the mouth
-  and eyes swap — the body never reloads, so there's no flicker.
+  mouth layers (same canvas, stacked like a South-Park cutout).
 - **Mic-driven mouth**: RMS loudness (with EMA smoothing) maps to four mouth
   levels (`closed → partial → medium → open`). Tune the pick-up thresholds and
   toggle individual levels live from the panel's **Mouth tuning** card — disable
@@ -16,16 +24,16 @@ web app, composited into **OBS** as a transparent Browser Source.
 - **Emotions as eye expressions**: an emotion is an optional eye-expression set
   under `eyes/<emotion>/`; triggering it swaps the eye layer while the mouth
   keeps reacting to the mic. Auto-reverts on a per-emotion timer.
-- **Data-driven assets**: drop in layered PNGs — no code. Partial mouth sets are
-  supported (a 2-frame set snaps to the nearest level).
+- **Virtual webcam (Linux)**: composites the avatar over a chroma background
+  and writes BGR4 (32-bit BGRA) to a v4l2loopback device, so it shows up in Zoom, Discord,
+  browsers, and OBS as a normal camera. (Webcams can't carry transparency —
+  key out the background in the consumer for an overlay.)
 - **Web control + REST API**: a built-in panel (`/`) for triggering emotions,
-  changing the resting face (★), and driving overrides, with keyboard shortcuts
-  plus a JSON WebSocket and REST endpoints for hotkeys / Stream Deck / automation.
+  changing the resting face (★), driving overrides, and tuning the mouth, with
+  keyboard shortcuts plus a JSON WebSocket and REST endpoints for hotkeys /
+  Stream Deck / automation.
 - **Single self-contained binary**: the web UI is embedded; only the character
   PNGs live on disk.
-- **Designed for OBS**: point a Browser Source at the *stage* URL for a
-  transparent, zero-plugin overlay. Rust never decodes PNGs — OBS's browser
-  engine does, so the hot path is trivially cheap.
 
 ---
 
@@ -74,7 +82,32 @@ and watch the mouth react to your mic. The repo ships placeholder art under
 5. The background is transparent — the avatar composites over your scene.
 
 > Use `stage.html` (bare avatar, transparent) for OBS, and `/` (control panel)
-> in your own browser. They share the same live state over WebSocket.
+> in your own browser. `stage.html` is a thin canvas: the Rust server composites
+> every avatar frame and streams it as a PNG, so the browser just displays it
+> (true transparency preserved for OBS).
+
+### Virtual webcam (Linux)
+
+The avatar can also appear as a normal camera in Zoom, Discord, browsers, and OBS
+via a **v4l2loopback** device. The server composites the avatar over an opaque
+chroma background (video devices carry no alpha) and writes BGR4 (BGRA) frames.
+
+One-time setup on Ubuntu:
+
+```bash
+sudo apt-get install v4l2loopback-dkms v4l2loopback-utils
+sudo modprobe v4l2loopback exclusive_caps=1 card_label="Rusty-Tuber"
+# Find the device it created:
+ls -1 /sys/class/video4linux/
+```
+
+Then enable it in `config.toml` (`[webcam] enabled = true`) and (re)start the
+server. It auto-detects the first v4l2loopback `/dev/videoN`, or use `device =
+"/dev/videoN"` to pin one. Pick the "Rusty-Tuber" camera in your app.
+
+Since the background is opaque, add a **Chroma Key** filter (OBS / your editor)
+keyed to the `[webcam].background` colour (default green `#00ff00`) to overlay
+the avatar — or keep the transparent Browser Source above for zero keying.
 
 ### Control panel
 
@@ -198,6 +231,12 @@ min_interval = 2.5         # Seconds between blinks (randomised in [min, max]).
 max_interval = 6.0
 duration = 0.12            # Seconds the eyes stay closed per blink.
 double_chance = 0.15       # Probability of a quick double-blink.
+
+[webcam]                   # Virtual webcam (Linux v4l2loopback; ignored elsewhere).
+enabled = false            # Set true once v4l2loopback is loaded.
+device = ""                # "/dev/videoN", or "" to auto-detect.
+fps = 30
+background = "#00ff00"     # #rrggbb opaque chroma fill (webcams carry no alpha).
 ```
 
 If `[audio].device` is empty, `mode = "input"` uses the system default mic and
@@ -225,7 +264,11 @@ Run `rusty-tuber list-audio-devices` any time to see the current options.
 
 ### WebSocket — `GET /ws`
 
-Messages use the envelope `{"type": "...", "payload": {...}}`.
+Messages use the envelope `{"type": "...", "payload": {...}}` for **text**
+control frames. The server also sends **binary** messages: each is a composited
+avatar PNG frame (alpha preserved) the browser draws straight to its canvas.
+Frames are pushed only when the visible state changes, so fast talking sends a
+few frames/sec, not a fixed-rate stream.
 
 **Client → server:**
 
@@ -299,31 +342,36 @@ curl -X POST http://127.0.0.1:8080/api/emotion/surprised
 mic/loopback ──cpal──▶ audio (RMS + EMA) ─┐
                                            ├─▶ state task (single owner)
 web app ──WS/REST──▶ net ───────────────┘        │  effective (emotion, mouth, eyes, volume)
-   ▲                                             │  → resolves eye + mouth layer URLs
-   └── StateUpdate (eyes_frame, mouth_frame) ◀── net (broadcast)
-                          │
-                          ▼
-   OBS Browser Source ◀─ HTTP (layers) + WS (state)
-                         base / eyes / mouth stacked in the browser
+                                                  │  → COMPOSITOR renders one RGBA frame on visible change
+   ┌──────────────────────────────────────────────┘  (watch channel)
+   ▼                                                  ▼
+   PNG encoder ──binary WS frames──▶  browser canvas (OBS Browser Source / panel)
+   webcam sink ──BGR4 + chroma bg──▶  /dev/videoN (v4l2loopback)
 ```
 
-- **`config.rs`** — typed, validated `config.toml` parsing (incl. `[blink]`).
+- **`config.rs`** — typed, validated `config.toml` parsing (incl. `[blink]`,
+  `[webcam]`).
 - **`assets.rs`** — layered catalog loader (base/mouths/eyes + emotion eye-sets)
   + nearest-level fallback quantizer for partial mouth sets.
 - **`audio.rs`** — cpal capture, lock-free RMS/EMA, `list-audio-devices`.
-- **`state.rs`** — single async owner; resolves the current eye/mouth layer
-  URLs, token-race-safe revert timers (a stale timer can never clobber a newer
-  emotion — the bug the original SDD design had), plus the randomised blink
-  scheduler.
-- **`protocol.rs`** — serde message types + the shared `MouthState`/`EyeState`
-  and the layered `LayerCatalog`.
-- **`net.rs`** — axum router: embedded UI, `ServeDir` for layers, WS, REST,
-  throttled broadcast, live snapshot for `/api/state`.
+- **`compositor.rs`** — decodes layers once, composites base+eyes+mouth into an
+  RGBA frame, PNG-encodes for the browser, alpha-over packing for the webcam.
+- **`state.rs`** — single async owner; resolves the current state, renders a
+  frame on visible change, token-race-safe revert timers, the randomised blink
+  scheduler, and the runtime mouth-config (levels + thresholds).
+- **`webcam.rs`** *(Linux)* — v4l2loopback sink: composites the avatar over the
+  chroma background, packs to BGR4 (BGRA), writes at a steady fps; auto-detects the
+  device.
+- **`protocol.rs`** — serde message types + the shared `MouthState`/`EyeState`,
+  the layered `LayerCatalog`, and `MouthConfig`.
+- **`net.rs`** — axum router: embedded UI, frame encoder, WS (JSON control +
+  binary PNG frames), REST, throttled broadcast, live snapshot for `/api/state`.
 
 The hot path (audio callback) only computes an RMS and maybe sends one channel
 message — no allocation, no locking, no image work. The callback body is wrapped
-in `catch_unwind` so a panic can't unwind across the realtime → FFI boundary, and
-PNG decoding happens in OBS's browser process.
+in `catch_unwind` so a panic can't unwind across the realtime → FFI boundary.
+Avatar compositing/encoding happens off the audio thread, only on visible
+change.
 
 ### Networking & security
 

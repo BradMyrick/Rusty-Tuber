@@ -29,6 +29,39 @@ use std::sync::Arc;
 use tokio::sync::mpsc::UnboundedSender;
 use tracing::{debug, info, warn};
 
+/// Shared, lock-free envelope tuning the realtime callback reads. The state
+/// task writes it (from config + panel sliders) via [`EnvelopeControl::set`];
+/// the audio callback reads [`EnvelopeControl::get`] each buffer. Both fields
+/// are stored as the bit pattern of an `f32` in `AtomicU32`s (Relaxed is fine —
+/// a torn read just applies one stale coefficient for a single buffer).
+#[derive(Clone)]
+pub struct EnvelopeControl {
+    attack_ms: Arc<AtomicU32>,
+    release_ms: Arc<AtomicU32>,
+}
+
+impl EnvelopeControl {
+    pub fn new(attack_ms: f32, release_ms: f32) -> Self {
+        Self {
+            attack_ms: Arc::new(AtomicU32::new(attack_ms.to_bits())),
+            release_ms: Arc::new(AtomicU32::new(release_ms.to_bits())),
+        }
+    }
+
+    pub fn get(&self) -> (f32, f32) {
+        (
+            f32::from_bits(self.attack_ms.load(Ordering::Relaxed)),
+            f32::from_bits(self.release_ms.load(Ordering::Relaxed)),
+        )
+    }
+
+    pub fn set(&self, attack_ms: f32, release_ms: f32) {
+        self.attack_ms.store(attack_ms.to_bits(), Ordering::Relaxed);
+        self.release_ms
+            .store(release_ms.to_bits(), Ordering::Relaxed);
+    }
+}
+
 /// Entry describing an input device, for the `--list-audio-devices` command.
 pub struct DeviceInfo {
     pub name: String,
@@ -155,6 +188,7 @@ fn negotiate_config(
 /// alive for the lifetime of the application (dropping it stops capture).
 pub fn start(
     audio: &AudioSettings,
+    envelope: EnvelopeControl,
     cmd_tx: UnboundedSender<StateCommand>,
 ) -> Result<Stream> {
     let device = pick_device(audio).context("selecting audio device")?;
@@ -162,33 +196,35 @@ pub fn start(
     let (base_config, sample_format) = negotiate_config(&device, audio)?;
 
     // Try a fixed buffer size first; fall back to the negotiated default.
-    let preferred = audio.buffer_size.max(1);
+    let preferred = audio.effective_buffer_size().max(1);
     let mut fixed_config = base_config.clone();
     fixed_config.buffer_size = cpal::BufferSize::Fixed(preferred);
     fixed_config.sample_rate = SampleRate(audio.sample_rate);
+    // Per-buffer interval for the envelope coefficients (seconds).
+    let buffer_interval = preferred as f32 / audio.sample_rate as f32;
 
+    let (att_ms, rel_ms) = envelope.get();
     info!(
         device = %device_name,
         sample_rate = fixed_config.sample_rate.0,
         channels = fixed_config.channels,
         buffer = preferred,
+        latency = ?audio.latency,
         format = ?sample_format,
-        smoothing = audio.smoothing_factor,
+        attack_ms = att_ms,
+        release_ms = rel_ms,
         mode = ?audio.mode,
         "starting audio capture"
     );
 
-    let smoothing_init = audio.smoothing_factor.clamp(0.0, 1.0);
-    // Smoothing weight is fixed for the lifetime of this stream (captured by
-    // value into the callback). Live tuning would require a shared atomic and a
-    // command path; left as a future feature when a calibration UI exists.
     let smoothed: Arc<AtomicU32> = Arc::new(AtomicU32::new(0.0f32.to_bits()));
 
     let err_cb = |err| warn!(error = %err, "audio stream error");
 
     let build = |cfg: StreamConfig| {
         let smoothed = smoothed.clone();
-        let alpha_v = smoothing_init;
+        let envelope = envelope.clone();
+        let dt = buffer_interval;
         let cmd_tx = cmd_tx.clone();
         let fmt = sample_format;
         device.build_input_stream_raw(
@@ -197,14 +233,19 @@ pub fn start(
             move |data, _info| {
                 // cpal backends don't guarantee catch_unwind around user
                 // callbacks on every platform; wrap the body so a panic can't
-                // unwind across the realtime -> FFI boundary (UB). A failed
-                // buffer is treated as silence for that callback.
+                // unwind across the realtime -> FFI boundary (UB).
                 let _ = catch_unwind(AssertUnwindSafe(|| {
                     let raw = compute_rms(data.bytes(), fmt);
                     let prev = f32::from_bits(smoothed.load(Ordering::Relaxed));
-                    let next = alpha_v * raw + (1.0 - alpha_v) * prev;
+                    // Asymmetric one-pole envelope: fast attack (mouth opens
+                    // within ~1 buffer), gentler release (smooth close). This
+                    // is what makes the avatar feel "instant" on talk-start
+                    // without fluttering on quiet syllables.
+                    let (att_ms, rel_ms) = envelope.get();
+                    let tau_ms = if raw > prev { att_ms } else { rel_ms };
+                    let coef = (-dt / (tau_ms.max(0.1) / 1000.0)).exp();
+                    let next = coef * prev + (1.0 - coef) * raw;
                     smoothed.store(next.to_bits(), Ordering::Relaxed);
-                    // UnboundedSender::send is synchronous and non-blocking.
                     let _ = cmd_tx.send(StateCommand::SetVolume(next));
                 }));
             },

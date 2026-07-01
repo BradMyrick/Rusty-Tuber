@@ -20,7 +20,9 @@
     height: 100vh;
   }
   #stage-wrap {
-    position: relative;
+    display: flex;
+    align-items: center;
+    justify-content: center;
     background:
       linear-gradient(45deg, #161b22 25%, transparent 25%) -20px 0/40px 40px,
       linear-gradient(-45deg, #161b22 25%, transparent 25%) -20px 0/40px 40px,
@@ -28,17 +30,22 @@
       linear-gradient(-45deg, transparent 75%, #161b22 75%) 0 0/40px 40px,
       #0d1117;
   }
-  /* The avatar is a stack of same-size transparent PNGs (base, eyes, mouth).
-     Each layer fills the stage and is letterboxed identically via
-     object-fit:contain, so the layers align pixel-perfect. */
-  .layer {
-    position: absolute;
-    top: 0;
-    left: 0;
-    width: 100%;
-    height: 100%;
+  /* The avatar comes from the virtual webcam: this panel reads it back as a
+     normal camera (getUserMedia). The video shows the composited feed over the
+     chroma background; OBS does the same via a Video Capture Device. */
+  #stage-wrap { position: relative; }
+  #preview-video {
+    max-width: 100%;
+    max-height: 100%;
     object-fit: contain;
-    pointer-events: none;
+    background: transparent;
+    transform: scaleX(-1); /* mirror, like a selfie cam */
+  }
+  #preview-btn {
+    position: absolute;
+    bottom: 16px;
+    left: 50%;
+    transform: translateX(-50%);
   }
   #controls {
     padding: 16px;
@@ -194,8 +201,8 @@
 <body data-mode="panel">
   <main>
     <section id="stage-wrap" aria-label="avatar preview">
-      <img id="layer-eyes" class="layer" alt="avatar, loading" />
-      <img id="layer-mouth" class="layer" alt="" />
+      <video id="preview-video" autoplay muted playsinline></video>
+      <button id="preview-btn" title="Show the virtual camera preview (needs camera permission)">Enable preview</button>
     </section>
     <section id="controls">
       <h1><span id="dot" role="status" aria-label="connection status"></span> Rusty-Tuber <span id="conn-text">connecting…</span></h1>
@@ -235,6 +242,12 @@
             <div id="thresholds" class="thresholds"></div>
           </div>
         </div>
+      </div>
+
+      <div class="card">
+        <h2>Audio response <span class="hint-inline">(envelope)</span></h2>
+        <div id="envelope" class="thresholds"></div>
+        <div class="hint-inline">Lower attack = snappier open; higher release = smoother close. Latency: <span id="latency-mode">—</span>.</div>
       </div>
 
       <div class="hint">
