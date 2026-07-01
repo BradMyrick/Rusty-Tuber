@@ -33,12 +33,16 @@ async fn next_json(
 async fn spawn_server() -> String {
     let cfg = config::AppConfig::from_path(std::path::Path::new("config.toml"))
         .unwrap();
-    let catalog =
-        Arc::new(assets::AssetCatalog::load(&cfg.engine.asset_root).unwrap());
+    let catalog = Arc::new(
+        assets::AssetCatalog::load(std::path::Path::new(
+            "./assets/characters/default_macaw",
+        ))
+        .unwrap(),
+    );
     let compositor = Arc::new(
         rusty_tuber::compositor::Compositor::new(
             catalog.clone(),
-            &cfg.engine.asset_root,
+            std::path::Path::new("./assets/characters/default_macaw"),
         )
         .unwrap(),
     );
@@ -58,6 +62,7 @@ async fn spawn_server() -> String {
         },
         rusty_tuber::protocol::MouthState::Closed,
         rusty_tuber::protocol::EyeState::Open,
+        &[],
     );
     let (frame_tx, _) = tokio::sync::watch::channel(std::sync::Arc::new(init));
     let envelope = rusty_tuber::audio::EnvelopeControl::new(6.0, 110.0);
@@ -85,9 +90,14 @@ async fn spawn_server() -> String {
             release_ms: 110.0,
         })),
         "low".into(),
+        frame_tx,
+        [0, 255, 0],
     ));
     let _rec = net::spawn_snapshot_recorder(app_state.clone());
-    let app = net::build_router(app_state, &cfg.engine.asset_root);
+    let app = net::build_router(
+        app_state,
+        std::path::Path::new("./assets/characters/default_macaw"),
+    );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {

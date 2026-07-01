@@ -27,7 +27,8 @@ anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 rand = "0.8"
 futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }
-image = { version = "0.25", default-features = false, features = ["png"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+tokio-stream = "0.1"
 
 # Linux-only: v4l2loopback ioctl/write for the virtual webcam sink.
 [target.'cfg(target_os = "linux")'.dependencies]

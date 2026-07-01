@@ -1,14 +1,10 @@
 // Rusty-Tuber web client (control panel). The Rust server composites the avatar
-// and writes it to a virtual webcam (v4l2loopback) — the SINGLE video output.
-// This panel reads that webcam back like any camera app (getUserMedia) for a
-// preview, and uses a text WebSocket only for control + the volume meter +
-// config (mouth levels, audio envelope). All avatar logic lives in Rust.
+// and writes it to a virtual webcam (v4l2loopback) — the primary output. The
+// panel previews via a server-side MJPEG stream (`<img src="/preview.mjpg">`),
+// and uses a text WebSocket for control + the volume meter + config.
 
 const mode = document.body.dataset.mode;
 const isPanel = mode === "panel";
-
-const previewVideo = document.getElementById("preview-video");
-const previewBtn = document.getElementById("preview-btn");
 
 const els = isPanel
   ? {
@@ -54,44 +50,6 @@ function wsUrl() {
 }
 
 // --- Webcam preview: read the virtual camera back via getUserMedia ---------
-// Read the virtual camera back like any webcam. Camera access needs a user
-// gesture + permission, hence the button. We open the default camera first so
-// the preview always works, then try to switch to the Rusty-Tuber device.
-async function enablePreview() {
-  if (!navigator.mediaDevices?.getUserMedia) {
-    showToast("Camera API unavailable (needs HTTPS or localhost).");
-    return;
-  }
-  let stream;
-  try {
-    stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
-  } catch (e) {
-    showToast("Camera access denied or unavailable: " + (e?.message || e));
-    return;
-  }
-  previewVideo.srcObject = stream;
-  previewBtn.hidden = true;
-
-  // Prefer the Rusty-Tuber device if the default wasn't it. Don't drop the
-  // working stream until the switch succeeds.
-  try {
-    const cams = await navigator.mediaDevices.enumerateDevices();
-    const rt = cams.find((d) => d.kind === "videoinput" && (d.label || "").includes("Rusty-Tuber"));
-    const current = stream.getVideoTracks()[0]?.label;
-    if (rt && rt.label !== current) {
-      const better = await navigator.mediaDevices.getUserMedia({
-        video: { deviceId: { exact: rt.deviceId } },
-        audio: false,
-      });
-      stream.getTracks().forEach((t) => t.stop());
-      previewVideo.srcObject = better;
-    }
-  } catch {
-    // Keep the default camera; just note the switch didn't take.
-    showToast("Showing default camera (couldn't switch to Rusty-Tuber).");
-  }
-}
-
 function send(msg) {
   if (socket && socket.readyState === WebSocket.OPEN) {
     socket.send(JSON.stringify(msg));
@@ -368,12 +326,6 @@ function applyState(payload) {
   state.eyesOverridden = payload.eyes_overridden === true;
   // The avatar video comes from the webcam (getUserMedia), not this WS message;
   // here we only update the UI (meter + control highlighting).
-  if (previewVideo && payload.emotion !== undefined) {
-    previewVideo.setAttribute(
-      "aria-label",
-      `avatar, ${payload.emotion || "default"}, mouth ${state.mouth}, eyes ${state.eyes}`
-    );
-  }
   if (isPanel) {
     updateMeter(payload.volume || 0);
     highlight();
@@ -537,9 +489,6 @@ if (isPanel && els.tuningToggle) {
     els.tuningToggle.textContent = open ? "hide" : "show";
     els.tuningToggle.setAttribute("aria-expanded", String(open));
   };
-}
-if (previewBtn) {
-  previewBtn.onclick = enablePreview;
 }
 
 connect();

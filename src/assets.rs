@@ -57,14 +57,11 @@ impl AssetCatalog {
             load_eye_set(asset_root, &asset_root.join("eyes"), "default eyes");
         let emotions = load_emotions(asset_root)?;
 
-        // `default_eyes.open` is mandatory — without it there's nothing to show.
+        // Eyes are optional (some characters use custom animations instead).
         if default_eyes.open.is_none() {
-            bail!(
-                "eyes/open.png is required under {} (the resting eyes frame)",
-                asset_root.display()
-            );
+            warn!("no eyes/ folder — blink will be a no-op");
         }
-        // `mouths.closed` + `mouths.open` are mandatory anchors.
+        // `closed` + `open` are mandatory anchors; `partial`/`medium` optional.
         if mouths.closed.is_none() || mouths.open.is_none() {
             bail!(
                 "mouths/closed.png and mouths/open.png are required under {}",
@@ -407,24 +404,24 @@ mod tests {
     }
 
     #[test]
-    fn missing_default_eyes_open_is_fatal() {
+    fn eyes_are_optional() {
         let d = tempdir_shim::Dir::new();
         let root = d.path().to_path_buf();
         touch(root.join("base/body.png"));
         touch(root.join("mouths/closed.png"));
         touch(root.join("mouths/open.png"));
-        // no eyes/open.png
-        let err = AssetCatalog::load(&root).unwrap_err();
-        assert!(format!("{err:#}").contains("eyes/open.png"));
+        // no eyes/ folder — should succeed (eyes optional)
+        let cat = AssetCatalog::load(&root).unwrap();
+        assert!(cat.catalog().default_eyes.open.is_none());
     }
 
     #[test]
-    fn missing_mouth_anchors_is_fatal() {
+    fn missing_mouths_open_is_fatal() {
         let d = tempdir_shim::Dir::new();
         let root = d.path().to_path_buf();
         touch(root.join("base/body.png"));
         touch(root.join("eyes/open.png"));
-        // no mouths
+        // no mouths at all
         let err = AssetCatalog::load(&root).unwrap_err();
         assert!(format!("{err:#}").contains("mouths/closed.png"));
     }

@@ -69,9 +69,11 @@ pub async fn run(cfg: config::AppConfig) -> Result<()> {
         },
         protocol::MouthState::Closed,
         protocol::EyeState::Open,
+        &[],
     );
     let (frame_tx, _) =
         tokio::sync::watch::channel(std::sync::Arc::new(init_frame));
+    let frame_tx_for_app = frame_tx.clone();
     #[cfg(target_os = "linux")]
     let webcam_rx = frame_tx.subscribe();
 
@@ -91,8 +93,10 @@ pub async fn run(cfg: config::AppConfig) -> Result<()> {
     // Eye-blink scheduler: posts BlinkClose/BlinkOpen at randomised intervals
     // until the command channel closes on shutdown.
     state::spawn_blink_scheduler(cmd_tx.clone(), cfg.blink.clone());
+    state::spawn_anim_scheduler(cmd_tx.clone(), compositor.anim_config());
 
     // --- Shared HTTP/WS state (control only — no video over WS) -------------
+    let preview_bg = cfg.webcam.background_rgb().unwrap_or([0, 255, 0]);
     let app_state = Arc::new(net::AppState::new(
         catalog.clone(),
         default_emotion,
@@ -105,6 +109,8 @@ pub async fn run(cfg: config::AppConfig) -> Result<()> {
             release_ms: cfg.audio.release_ms,
         })),
         format!("{:?}", cfg.audio.latency).to_ascii_lowercase(),
+        frame_tx_for_app,
+        preview_bg,
     ));
     let _recorder = net::spawn_snapshot_recorder(app_state.clone());
     #[cfg(target_os = "linux")]

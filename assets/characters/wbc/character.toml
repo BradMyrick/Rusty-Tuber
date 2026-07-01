@@ -1,0 +1,14 @@
+# WBC character config.
+# The base/mouths/eyes folders are auto-detected. This file defines custom
+# animation channels — independent layered animations the compositor overlays.
+
+# Worm animation: 5 independent worms, each cycling between 2 frames at random
+# intervals (unsynced, looks like worms wriggling). Replaces the default blink.
+[[anim]]
+name = "worms"
+driver = "random_cycle"    # each instance cycles its frames at random intervals
+instances = 5              # number of independent layers
+frames = 2                 # frames per instance
+file_pattern = "worm{n}-{f}.png"  # {n} = instance (1-based), {f} = frame (1-based)
+min_interval = 0.08        # seconds between frame advances (randomised)
+max_interval = 0.35

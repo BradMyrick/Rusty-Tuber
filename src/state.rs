@@ -65,6 +65,8 @@ pub enum StateCommand {
     SetEyesOverride(EyeState),
     /// Client released a forced eye state; resume blinking.
     ClearEyesOverride,
+    /// Animation scheduler advanced an instance to a new frame.
+    AnimFrame { instance: usize, frame: usize },
     /// Internal: a revert-timer fired. Only applied if `token` equals the
     /// currently active token.
     TimerClear(u64),
@@ -122,6 +124,8 @@ pub fn spawn(
     bcast: broadcast::Sender<ServerMessage>,
     frame_tx: watch::Sender<Arc<Frame>>,
 ) -> JoinHandle<()> {
+    let anim_count: usize =
+        compositor.anim_config().iter().map(|c| c.instances).sum();
     let mut machine = StateMachine {
         catalog,
         compositor,
@@ -142,8 +146,10 @@ pub fn spawn(
         last_sent_emotion: default_emotion,
         last_sent_mouth: MouthState::Closed,
         last_sent_eyes: EyeState::Open,
-        last_frame_keys: (String::new(), String::new()),
+        last_frame_keys: (String::new(), String::new(), 0),
         last_vol_broadcast: Instant::now(),
+        anim_frames: vec![0; anim_count],
+        anim_version: 0,
     };
 
     tokio::spawn(async move {
@@ -185,8 +191,10 @@ struct StateMachine {
     last_sent_eyes: EyeState,
     /// Last (eyes_frame, mouth_frame) we rendered — skips re-compositing when
     /// only the volume (meter) drifted but the visible frame didn't change.
-    last_frame_keys: (String, String),
+    last_frame_keys: (String, String, u64),
     last_vol_broadcast: Instant,
+    anim_frames: Vec<usize>,
+    anim_version: u64,
 }
 
 impl StateMachine {
@@ -334,6 +342,13 @@ impl StateMachine {
                 self.eyes_override = None;
                 self.broadcast_now();
             }
+            StateCommand::AnimFrame { instance, frame } => {
+                if instance < self.anim_frames.len() {
+                    self.anim_frames[instance] = frame;
+                    self.anim_version = self.anim_version.wrapping_add(1);
+                    self.broadcast_now();
+                }
+            }
             StateCommand::Shutdown => unreachable!("handled by the run loop"),
         }
     }
@@ -386,7 +401,7 @@ impl StateMachine {
         let _ = self.bcast.send(msg);
         // Re-composite the avatar only when the visible layers actually
         // changed (skips volume-only meter drift), then push to sinks.
-        let key = (eyes_frame, mouth_frame);
+        let key = (eyes_frame, mouth_frame, self.anim_version);
         if key != self.last_frame_keys {
             self.last_frame_keys = key;
             let emotion_opt = if emotion.is_empty() {
@@ -394,7 +409,12 @@ impl StateMachine {
             } else {
                 Some(emotion)
             };
-            let frame = self.compositor.render(emotion_opt, mouth, eyes);
+            let frame = self.compositor.render(
+                emotion_opt,
+                mouth,
+                eyes,
+                &self.anim_frames,
+            );
             let _ = self.frame_tx.send(Arc::new(frame));
         }
         self.last_sent_emotion = emotion.to_string();
@@ -443,6 +463,43 @@ pub fn spawn_blink_scheduler(
             }
         }
     });
+}
+
+/// Spawn per-instance animation timers for all `random_cycle` groups. Each
+/// instance independently cycles its frames at random intervals (unsynced).
+pub fn spawn_anim_scheduler(
+    cmd_tx: mpsc::UnboundedSender<StateCommand>,
+    config: &[crate::compositor::AnimSchedulerConfig],
+) {
+    let mut offset = 0usize;
+    for cfg in config {
+        for _ in 0..cfg.instances {
+            let tx = cmd_tx.clone();
+            let abs = offset;
+            let min = cfg.min_interval;
+            let max = cfg.max_interval;
+            let frames = cfg.frames;
+            tokio::spawn(async move {
+                let mut rng = StdRng::from_entropy();
+                let mut frame = 0usize;
+                loop {
+                    let interval = rng.gen_range(min..=max);
+                    tokio::time::sleep(Duration::from_secs_f32(interval)).await;
+                    frame = (frame + 1) % frames.max(1);
+                    if tx
+                        .send(StateCommand::AnimFrame {
+                            instance: abs,
+                            frame,
+                        })
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+            });
+            offset += 1;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -532,7 +589,8 @@ mod tests {
         timers.insert("surprised".into(), 0.1_f32); // short for tests
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         let (bcast_tx, bcast_rx) = broadcast::channel(64);
-        let init = compositor.render(None, MouthState::Closed, EyeState::Open);
+        let init =
+            compositor.render(None, MouthState::Closed, EyeState::Open, &[]);
         let (frame_tx, _frame_rx) = watch::channel(Arc::new(init));
         let handle = spawn(
             catalog,

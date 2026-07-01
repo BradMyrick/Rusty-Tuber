@@ -22,7 +22,7 @@ enabled = ["closed", "partial", "medium", "open"]
 [engine]
 # Resting emotion (eye-set). Empty = base/default eyes.
 default_emotion = ""
-asset_root = "./assets/characters/default_macaw"
+asset_root = "./assets/characters/wbc"
 bind = "127.0.0.1:8080"
 
 # Emotion auto-revert timers (seconds). Empty by default (no emotion art ships).

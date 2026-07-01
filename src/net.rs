@@ -11,6 +11,7 @@
 //! also recorded so `GET /api/state` can answer without IPC with the state task.
 
 use crate::assets::AssetCatalog;
+use crate::compositor::Frame;
 use crate::protocol::{
     AvatarSnapshot, ClientMessage, EnvelopeConfig, EyeState, MouthConfig,
     MouthState, ServerMessage,
@@ -26,7 +27,7 @@ use futures_util::{SinkExt, StreamExt};
 use rust_embed::RustEmbed;
 use std::path::Path as FsPath;
 use std::sync::Arc;
-use tokio::sync::{broadcast, mpsc, RwLock, Semaphore};
+use tokio::sync::{broadcast, mpsc, watch, RwLock, Semaphore};
 use tokio::task::JoinHandle;
 use tower_http::set_header::SetResponseHeaderLayer;
 use tracing::{debug, warn};
@@ -58,12 +59,15 @@ pub struct AppState {
     pub envelope: Arc<RwLock<EnvelopeConfig>>,
     /// Audio latency preset in use ("low" / "stable") — surfaced in `Welcome`.
     pub latency: String,
+    /// Compositor frame channel — the MJPEG preview endpoint subscribes.
+    pub frame_tx: watch::Sender<Arc<Frame>>,
+    /// Background colour for the MJPEG preview (webcams have no alpha).
+    pub preview_bg: [u8; 3],
     /// Limits concurrent WebSocket clients to [`MAX_WS_CLIENTS`].
     pub ws_permits: Arc<Semaphore>,
 }
 
 impl AppState {
-    /// Construct shared state with the default WebSocket concurrency cap.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         catalog: Arc<AssetCatalog>,
@@ -74,6 +78,8 @@ impl AppState {
         mouth_config: Arc<RwLock<MouthConfig>>,
         envelope: Arc<RwLock<EnvelopeConfig>>,
         latency: String,
+        frame_tx: watch::Sender<Arc<Frame>>,
+        preview_bg: [u8; 3],
     ) -> Self {
         Self {
             catalog,
@@ -84,6 +90,8 @@ impl AppState {
             mouth_config,
             envelope,
             latency,
+            frame_tx,
+            preview_bg,
             ws_permits: Arc::new(Semaphore::new(MAX_WS_CLIENTS)),
         }
     }
@@ -105,6 +113,7 @@ pub fn build_router(state: Arc<AppState>, asset_root: &FsPath) -> Router {
         .route("/", get(index))
         .route("/:file", get(embedded_file))
         .route("/ws", get(ws_handler))
+        .route("/preview.mjpg", get(preview_mjpg))
         .nest("/frames", frames)
         .nest("/api", api_router())
         .with_state(state)
@@ -642,4 +651,87 @@ async fn default_or_snapshot(st: &AppState) -> String {
         .as_ref()
         .map(|s| s.default_emotion.clone())
         .unwrap_or_else(|| st.default_emotion.clone())
+}
+
+// --- MJPEG preview stream -------------------------------------------------
+
+/// Serve the compositor frame as a multipart/x-mixed-replace JPEG stream that
+/// an `<img>` tag displays natively. No getUserMedia / camera permission needed
+/// — works regardless of browser sandbox or PipeWire portal. Only emits a new
+/// frame when the avatar actually changes.
+async fn preview_mjpg(State(st): State<Arc<AppState>>) -> Response {
+    use axum::body::Body;
+    use tokio_stream::wrappers::ReceiverStream;
+
+    let (tx, rx) = mpsc::channel::<Result<Vec<u8>, std::io::Error>>(4);
+    let mut frame_rx = st.frame_tx.subscribe();
+    let bg = st.preview_bg;
+
+    tokio::spawn(async move {
+        loop {
+            let frame = frame_rx.borrow().clone();
+            let jpeg =
+                tokio::task::spawn_blocking(move || frame_to_jpeg(&frame, bg))
+                    .await;
+            let jpeg = match jpeg {
+                Ok(Ok(j)) => j,
+                _ => break,
+            };
+            let header = format!(
+                "\r\n--frame\r\nContent-Type: image/jpeg\r\nContent-Length: {}\r\n\r\n",
+                jpeg.len()
+            );
+            if tx.send(Ok(header.into_bytes())).await.is_err() {
+                break;
+            }
+            if tx.send(Ok(jpeg)).await.is_err() {
+                break;
+            }
+            if frame_rx.changed().await.is_err() {
+                break;
+            }
+        }
+    });
+
+    Response::builder()
+        .header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
+        .header("Cache-Control", "no-cache, private")
+        .body(Body::from_stream(ReceiverStream::new(rx)))
+        .unwrap()
+}
+
+/// Composite the RGBA frame over a background colour and JPEG-encode the result.
+fn frame_to_jpeg(frame: &Frame, bg: [u8; 3]) -> anyhow::Result<Vec<u8>> {
+    let w = frame.width;
+    let h = frame.height;
+    let mut rgb = Vec::with_capacity((w as usize) * (h as usize) * 3);
+    let rgba = &frame.rgba;
+    for i in 0..(w as usize * h as usize) {
+        let j = i * 4;
+        let a = rgba[j + 3] as u32;
+        if a == 0 {
+            rgb.extend_from_slice(&bg);
+        } else if a == 255 {
+            rgb.push(rgba[j]);
+            rgb.push(rgba[j + 1]);
+            rgb.push(rgba[j + 2]);
+        } else {
+            let inv = 255 - a;
+            rgb.push(((a * rgba[j] as u32 + inv * bg[0] as u32) / 255) as u8);
+            rgb.push(
+                ((a * rgba[j + 1] as u32 + inv * bg[1] as u32) / 255) as u8,
+            );
+            rgb.push(
+                ((a * rgba[j + 2] as u32 + inv * bg[2] as u32) / 255) as u8,
+            );
+        }
+    }
+    let img = image::RgbImage::from_raw(w, h, rgb)
+        .ok_or_else(|| anyhow::anyhow!("failed to build RGB image for JPEG"))?;
+    let mut buf = Vec::with_capacity((w as usize) * (h as usize) / 4);
+    image::DynamicImage::ImageRgb8(img).write_to(
+        &mut std::io::Cursor::new(&mut buf),
+        image::ImageFormat::Jpeg,
+    )?;
+    Ok(buf)
 }

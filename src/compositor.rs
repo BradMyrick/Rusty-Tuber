@@ -1,29 +1,20 @@
 //! Server-side avatar compositor — the universal source of truth for what the
 //! avatar looks like at any moment.
 //!
-//! All layer PNGs are decoded once at startup into in-memory [`RgbaImage`]s.
-//! [`Compositor::render`] then composites the static base + the current eye
-//! layer + the current mouth layer into a single RGBA frame (transparent where
-//! the avatar is empty). That frame feeds every output sink:
-//!
-//! - the **browser sink** encodes it to PNG (alpha preserved) for the
-//!   transparent OBS Browser Source;
-//! - the **webcam sink** composites it over a chroma background and writes it
-//!   to a v4l2loopback device.
-//!
-//! Compositing is pure CPU alpha-over and runs only when the visible state
-//! changes (a few times per second while talking), so the hot audio path and
-//! the 20 Hz meter updates are untouched.
+//! All layer PNGs are decoded once at startup. [`Compositor::render`] composites
+//! the static base + eye + mouth layers + any custom animation overlays into a
+//! single RGBA frame that feeds the virtual webcam.
 
 use crate::assets::AssetCatalog;
 use crate::protocol::{EyeState, MouthState};
 use anyhow::{Context, Result};
 use image::imageops;
 use image::RgbaImage;
+use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
-use tracing::info;
+use tracing::{info, warn};
 
 /// A composited RGBA frame. `rgba` is `width * height * 4` bytes, straight
 /// (non-premultiplied) alpha, row-major top-to-bottom.
@@ -37,16 +28,55 @@ pub struct Frame {
 /// Decoded layer cache + renderer. Cheap to `render` (the static base is
 /// pre-composited once; each render copies it and overlays the sparse eye/mouth
 /// layers with a skip-transparent blit); shared behind an `Arc`.
+/// Scheduler parameters for one animation group.
+pub struct AnimSchedulerConfig {
+    pub instances: usize,
+    pub frames: usize,
+    pub min_interval: f32,
+    pub max_interval: f32,
+}
+
+struct AnimInstance {
+    frames: Vec<RgbaImage>,
+}
+
+#[derive(Deserialize)]
+struct CharacterToml {
+    #[serde(default)]
+    anim: Vec<AnimDef>,
+}
+
+#[derive(Deserialize)]
+struct AnimDef {
+    name: String,
+    #[serde(default = "d_one")]
+    instances: usize,
+    frames: usize,
+    file_pattern: String,
+    #[serde(default = "d_min_int")]
+    min_interval: f32,
+    #[serde(default = "d_max_int")]
+    max_interval: f32,
+}
+
+fn d_one() -> usize {
+    1
+}
+fn d_min_int() -> f32 {
+    0.1
+}
+fn d_max_int() -> f32 {
+    0.5
+}
+
 pub struct Compositor {
     width: u32,
     height: u32,
-    /// The static body, fully composited once at startup into a flat RGBA
-    /// buffer. Each render just copies this (one memcpy, no alpha math).
     base_composited: Vec<u8>,
-    /// Every decodeable layer keyed by its catalog rel-path
-    /// (e.g. `mouths/open.png`, `eyes/happy/closed.png`).
     layers: HashMap<String, RgbaImage>,
     catalog: Arc<AssetCatalog>,
+    anim_instances: Vec<AnimInstance>,
+    anim_config: Vec<AnimSchedulerConfig>,
 }
 
 impl Compositor {
@@ -100,13 +130,24 @@ impl Compositor {
             }
         }
 
-        info!(width, height, layers = layers.len(), "compositor ready");
+        // Custom animation channels from character.toml.
+        let (anim_instances, anim_config) = load_anim(asset_root)?;
+
+        info!(
+            width,
+            height,
+            layers = layers.len(),
+            anim_instances = anim_instances.len(),
+            "compositor ready"
+        );
         Ok(Compositor {
             width,
             height,
             base_composited,
             layers,
             catalog,
+            anim_instances,
+            anim_config,
         })
     }
 
@@ -114,13 +155,17 @@ impl Compositor {
     /// base (cheap memcpy) then overlays the eye + mouth layers with a
     /// skip-transparent blit — those layers are sparse, so most pixels are
     /// skipped. The result keeps a transparent background; sinks fill it.
+    pub fn anim_config(&self) -> &[AnimSchedulerConfig] {
+        &self.anim_config
+    }
+
     pub fn render(
         &self,
         emotion: Option<&str>,
         mouth: MouthState,
         eyes: EyeState,
+        anim_frames: &[usize],
     ) -> Frame {
-        // Start from the pre-composited base (no alpha math, no zero-fill).
         let mut rgba = Vec::with_capacity(self.base_composited.len());
         rgba.extend_from_slice(&self.base_composited);
         if let Some(url) = self.catalog.eyes_frame(emotion, eyes) {
@@ -130,6 +175,12 @@ impl Compositor {
         }
         if let Some(url) = self.catalog.mouth_frame(mouth) {
             if let Some(img) = self.layers.get(rel_of(&url)) {
+                overlay_skip(&mut rgba, img.as_raw());
+            }
+        }
+        for (i, inst) in self.anim_instances.iter().enumerate() {
+            let f = anim_frames.get(i).copied().unwrap_or(0);
+            if let Some(img) = inst.frames.get(f) {
                 overlay_skip(&mut rgba, img.as_raw());
             }
         }
@@ -207,6 +258,59 @@ fn decode_into(
     Ok(())
 }
 
+/// Load custom animation groups from `character.toml` + decode their frames.
+/// Returns `(instances, scheduler_configs)` — one instance per independent
+/// animated layer, plus the timing config the scheduler needs.
+fn load_anim(
+    root: &Path,
+) -> Result<(Vec<AnimInstance>, Vec<AnimSchedulerConfig>)> {
+    let toml_path = root.join("character.toml");
+    if !toml_path.exists() {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    let raw = std::fs::read_to_string(&toml_path)
+        .with_context(|| format!("reading {}", toml_path.display()))?;
+    let cfg: CharacterToml = toml::from_str(&raw)
+        .with_context(|| format!("parsing {}", toml_path.display()))?;
+
+    let mut instances = Vec::new();
+    let mut configs = Vec::new();
+    for def in &cfg.anim {
+        let dir = root.join("anim").join(&def.name);
+        for n in 1..=def.instances {
+            let mut frames = Vec::new();
+            for f in 1..=def.frames {
+                let fname = def
+                    .file_pattern
+                    .replace("{n}", &n.to_string())
+                    .replace("{f}", &f.to_string());
+                let path = dir.join(&fname);
+                if path.exists() {
+                    frames.push(image::open(&path)?.to_rgba8());
+                } else {
+                    warn!(file = %path.display(), "animation frame missing");
+                }
+            }
+            if !frames.is_empty() {
+                instances.push(AnimInstance { frames });
+            }
+        }
+        configs.push(AnimSchedulerConfig {
+            instances: def.instances,
+            frames: def.frames,
+            min_interval: def.min_interval,
+            max_interval: def.max_interval,
+        });
+        info!(
+            group = %def.name,
+            instances = def.instances,
+            frames = def.frames,
+            "loaded animation group"
+        );
+    }
+    Ok((instances, configs))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -278,7 +382,7 @@ mod tests {
         // Mouth=Partial snaps to closed (nearest). The top-left pixel should be
         // the mouth (green) since the mouth is drawn over the white eyes over
         // the red base — last-wins at (0,0) is mouth green.
-        let frame = comp.render(None, MouthState::Partial, EyeState::Open);
+        let frame = comp.render(None, MouthState::Partial, EyeState::Open, &[]);
         assert_eq!((frame.width, frame.height), (2, 2));
         let p = &frame.rgba[0..4];
         assert_eq!(p, &[0, 255, 0, 255]); // green closed mouth wins
