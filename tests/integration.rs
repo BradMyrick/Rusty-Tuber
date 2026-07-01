@@ -66,17 +66,28 @@ async fn spawn_server() -> String {
     );
     let (frame_tx, _) = tokio::sync::watch::channel(std::sync::Arc::new(init));
     let envelope = rusty_tuber::audio::EnvelopeControl::new(6.0, 110.0);
+    let anim_count: usize =
+        compositor.anim_config().iter().map(|c| c.instances).sum();
+    let (render_tx, render_rx) =
+        tokio::sync::watch::channel(rusty_tuber::state::RenderRequest {
+            emotion: None,
+            mouth: rusty_tuber::protocol::MouthState::Closed,
+            eyes: rusty_tuber::protocol::EyeState::Open,
+            anim_frames: vec![0; anim_count],
+            version: 0,
+        });
+    rusty_tuber::state::spawn_renderer(compositor, render_rx, frame_tx.clone());
     let _state = state::spawn(
         catalog.clone(),
-        compositor,
         mouth_config.clone(),
         envelope,
         cfg.timers.clone(),
         default_emotion.clone(),
+        anim_count,
         cmd_tx.clone(),
         cmd_rx,
         bcast_tx.clone(),
-        frame_tx.clone(),
+        render_tx,
     );
     let app_state = Arc::new(net::AppState::new(
         catalog.clone(),

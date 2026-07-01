@@ -31,6 +31,47 @@ use tokio::sync::{broadcast, mpsc, watch};
 use tokio::task::JoinHandle;
 use tracing::{debug, trace};
 
+/// Lightweight state snapshot for the render thread.
+#[derive(Clone)]
+pub struct RenderRequest {
+    pub emotion: Option<String>,
+    pub mouth: MouthState,
+    pub eyes: EyeState,
+    pub anim_frames: Vec<usize>,
+    pub version: u64,
+}
+
+/// Dedicated render thread: polls the state watch and composites the latest
+/// state. If state changes mid-render, the next render uses the latest — no
+/// stale backlogs.
+pub fn spawn_renderer(
+    compositor: Arc<Compositor>,
+    state_rx: watch::Receiver<RenderRequest>,
+    frame_tx: watch::Sender<Arc<Frame>>,
+) {
+    std::thread::spawn(move || {
+        let mut last_version = u64::MAX;
+        loop {
+            if state_rx.has_changed().unwrap_or(false) {
+                let req = state_rx.borrow().clone();
+                if req.version == last_version {
+                    continue;
+                }
+                last_version = req.version;
+                let frame = compositor.render(
+                    req.emotion.as_deref(),
+                    req.mouth,
+                    req.eyes,
+                    &req.anim_frames,
+                );
+                let _ = frame_tx.send(Arc::new(frame));
+            } else {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }
+    });
+}
+
 /// Minimum interval between volume-only broadcasts (meter refresh cap).
 const VOLUME_BROADCAST_INTERVAL: Duration = Duration::from_millis(50);
 
@@ -114,21 +155,18 @@ pub fn volume_to_mouth(v: f32, cfg: &MouthConfig) -> MouthState {
 #[allow(clippy::too_many_arguments)]
 pub fn spawn(
     catalog: Arc<AssetCatalog>,
-    compositor: Arc<Compositor>,
     mouth_config: MouthConfig,
     envelope: EnvelopeControl,
     timers: HashMap<String, f32>,
     default_emotion: String,
+    anim_count: usize,
     cmd_tx: mpsc::UnboundedSender<StateCommand>,
     mut cmd_rx: mpsc::UnboundedReceiver<StateCommand>,
     bcast: broadcast::Sender<ServerMessage>,
-    frame_tx: watch::Sender<Arc<Frame>>,
+    render_tx: watch::Sender<RenderRequest>,
 ) -> JoinHandle<()> {
-    let anim_count: usize =
-        compositor.anim_config().iter().map(|c| c.instances).sum();
     let mut machine = StateMachine {
         catalog,
-        compositor,
         mouth_config,
         envelope,
         timers,
@@ -142,7 +180,8 @@ pub fn spawn(
         active_token: 0,
         cmd_tx,
         bcast,
-        frame_tx,
+        render_tx,
+        render_version: 0,
         last_sent_emotion: default_emotion,
         last_sent_mouth: MouthState::Closed,
         last_sent_eyes: EyeState::Open,
@@ -166,7 +205,6 @@ pub fn spawn(
 
 struct StateMachine {
     catalog: Arc<AssetCatalog>,
-    compositor: Arc<Compositor>,
     mouth_config: MouthConfig,
     envelope: EnvelopeControl,
     timers: HashMap<String, f32>,
@@ -174,23 +212,17 @@ struct StateMachine {
     emotion_override: Option<String>,
     mouth_override: Option<MouthState>,
     eyes_override: Option<EyeState>,
-    /// Mic-derived mouth (ignored while `mouth_override` is `Some`).
     mouth: MouthState,
-    /// Blink-derived eyes (ignored while `eyes_override` is `Some`).
     eyes: EyeState,
     volume: f32,
-    /// Bumped on every emotion trigger; stale timers carry an older token.
     active_token: u64,
     cmd_tx: mpsc::UnboundedSender<StateCommand>,
     bcast: broadcast::Sender<ServerMessage>,
-    /// Pushes a freshly composited RGBA frame to the output sinks (browser +
-    /// webcam) whenever the visible layers change.
-    frame_tx: watch::Sender<Arc<Frame>>,
+    render_tx: watch::Sender<RenderRequest>,
+    render_version: u64,
     last_sent_emotion: String,
     last_sent_mouth: MouthState,
     last_sent_eyes: EyeState,
-    /// Last (eyes_frame, mouth_frame) we rendered — skips re-compositing when
-    /// only the volume (meter) drifted but the visible frame didn't change.
     last_frame_keys: (String, String, u64),
     last_vol_broadcast: Instant,
     anim_frames: Vec<usize>,
@@ -346,7 +378,10 @@ impl StateMachine {
                 if instance < self.anim_frames.len() {
                     self.anim_frames[instance] = frame;
                     self.anim_version = self.anim_version.wrapping_add(1);
-                    self.broadcast_now();
+                    // Worms are invisible while talking — only re-render at rest.
+                    if self.effective_mouth() == MouthState::Closed {
+                        self.broadcast_now();
+                    }
                 }
             }
             StateCommand::Shutdown => unreachable!("handled by the run loop"),
@@ -401,21 +436,27 @@ impl StateMachine {
         let _ = self.bcast.send(msg);
         // Re-composite the avatar only when the visible layers actually
         // changed (skips volume-only meter drift), then push to sinks.
-        let key = (eyes_frame, mouth_frame, self.anim_version);
+        let key = (eyes_frame.clone(), mouth_frame.clone(), self.anim_version);
         if key != self.last_frame_keys {
             self.last_frame_keys = key;
-            let emotion_opt = if emotion.is_empty() {
-                None
+            self.render_version = self.render_version.wrapping_add(1);
+            // Worms disappear while talking — only show them at rest (closed).
+            let anim = if mouth == MouthState::Closed {
+                self.anim_frames.clone()
             } else {
-                Some(emotion)
+                Vec::new()
             };
-            let frame = self.compositor.render(
-                emotion_opt,
+            let _ = self.render_tx.send(RenderRequest {
+                emotion: if emotion.is_empty() {
+                    None
+                } else {
+                    Some(emotion.to_string())
+                },
                 mouth,
                 eyes,
-                &self.anim_frames,
-            );
-            let _ = self.frame_tx.send(Arc::new(frame));
+                anim_frames: anim,
+                version: self.render_version,
+            });
         }
         self.last_sent_emotion = emotion.to_string();
         self.last_sent_mouth = mouth;
@@ -585,24 +626,34 @@ mod tests {
         let catalog = Arc::new(cat);
         let compositor =
             Arc::new(Compositor::new(catalog.clone(), &root).unwrap());
+        let anim_count: usize =
+            compositor.anim_config().iter().map(|c| c.instances).sum();
         let mut timers = HashMap::new();
-        timers.insert("surprised".into(), 0.1_f32); // short for tests
+        timers.insert("surprised".into(), 0.1_f32);
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         let (bcast_tx, bcast_rx) = broadcast::channel(64);
         let init =
             compositor.render(None, MouthState::Closed, EyeState::Open, &[]);
-        let (frame_tx, _frame_rx) = watch::channel(Arc::new(init));
+        let (frame_tx, _) = watch::channel(Arc::new(init));
+        let (render_tx, render_rx) = watch::channel(RenderRequest {
+            emotion: None,
+            mouth: MouthState::Closed,
+            eyes: EyeState::Open,
+            anim_frames: vec![0; anim_count],
+            version: 0,
+        });
+        spawn_renderer(compositor, render_rx, frame_tx);
         let handle = spawn(
             catalog,
-            compositor,
             mouth_config(),
             crate::audio::EnvelopeControl::new(6.0, 110.0),
             timers,
-            String::new(), // no resting emotion -> default eyes
+            String::new(),
+            anim_count,
             cmd_tx.clone(),
             cmd_rx,
             bcast_tx,
-            frame_tx,
+            render_tx,
         );
         (cmd_tx, bcast_rx, handle)
     }

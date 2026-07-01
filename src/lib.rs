@@ -54,13 +54,22 @@ pub async fn run(cfg: config::AppConfig) -> Result<()> {
         catalog.clone(),
         &cfg.engine.asset_root,
     )?);
+    let anim_count: usize =
+        compositor.anim_config().iter().map(|c| c.instances).sum();
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<state::StateCommand>();
     let (bcast_tx, _) = broadcast::channel::<protocol::ServerMessage>(256);
 
-    // The compositor's frame is the universal source of truth. The webcam is
-    // the SINGLE video output; the browser reads it back as a normal camera
-    // (getUserMedia), so we don't stream frames over WebSocket — one render,
-    // one consumer, no duplicated work.
+    // Render pipeline: state task → RenderRequest (watch) → render thread →
+    // Frame (watch) → webcam + MJPEG. The state task never blocks on
+    // compositing; the render thread always works from the latest state.
+    let (render_tx, render_rx) =
+        tokio::sync::watch::channel(state::RenderRequest {
+            emotion: None,
+            mouth: protocol::MouthState::Closed,
+            eyes: protocol::EyeState::Open,
+            anim_frames: vec![0; anim_count],
+            version: 0,
+        });
     let init_frame = compositor.render(
         if default_emotion.is_empty() {
             None
@@ -77,21 +86,21 @@ pub async fn run(cfg: config::AppConfig) -> Result<()> {
     #[cfg(target_os = "linux")]
     let webcam_rx = frame_tx.subscribe();
 
+    state::spawn_renderer(compositor.clone(), render_rx, frame_tx.clone());
+
     let state_handle = state::spawn(
         catalog.clone(),
-        compositor.clone(),
         mouth_config.clone(),
         envelope.clone(),
         cfg.timers.clone(),
         default_emotion.clone(),
+        anim_count,
         cmd_tx.clone(),
         cmd_rx,
         bcast_tx.clone(),
-        frame_tx,
+        render_tx,
     );
 
-    // Eye-blink scheduler: posts BlinkClose/BlinkOpen at randomised intervals
-    // until the command channel closes on shutdown.
     state::spawn_blink_scheduler(cmd_tx.clone(), cfg.blink.clone());
     state::spawn_anim_scheduler(cmd_tx.clone(), compositor.anim_config());
 
