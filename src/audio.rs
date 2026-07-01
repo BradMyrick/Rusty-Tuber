@@ -29,11 +29,10 @@ use std::sync::Arc;
 use tokio::sync::mpsc::UnboundedSender;
 use tracing::{debug, info, warn};
 
-/// Shared, lock-free envelope tuning the realtime callback reads. The state
-/// task writes it (from config + panel sliders) via [`EnvelopeControl::set`];
-/// the audio callback reads [`EnvelopeControl::get`] each buffer. Both fields
-/// are stored as the bit pattern of an `f32` in `AtomicU32`s (Relaxed is fine —
-/// a torn read just applies one stale coefficient for a single buffer).
+/// Lock-free envelope tuning shared between the state task (writer) and the
+/// realtime audio callback (reader). Values are stored as `f32` bit patterns in
+/// `AtomicU32`s; `Relaxed` ordering suffices — a torn read only applies one
+/// stale coefficient for a single buffer.
 #[derive(Clone)]
 pub struct EnvelopeControl {
     attack_ms: Arc<AtomicU32>,
@@ -231,16 +230,13 @@ pub fn start(
             &cfg,
             fmt,
             move |data, _info| {
-                // cpal backends don't guarantee catch_unwind around user
-                // callbacks on every platform; wrap the body so a panic can't
-                // unwind across the realtime -> FFI boundary (UB).
+                // Guard against panics unwinding across the realtime/FFI
+                // boundary, which is UB in cpal callbacks.
                 let _ = catch_unwind(AssertUnwindSafe(|| {
                     let raw = compute_rms(data.bytes(), fmt);
                     let prev = f32::from_bits(smoothed.load(Ordering::Relaxed));
-                    // Asymmetric one-pole envelope: fast attack (mouth opens
-                    // within ~1 buffer), gentler release (smooth close). This
-                    // is what makes the avatar feel "instant" on talk-start
-                    // without fluttering on quiet syllables.
+                    // Asymmetric one-pole: fast attack so the mouth opens within
+                    // ~1 buffer, slower release for a smooth close.
                     let (att_ms, rel_ms) = envelope.get();
                     let tau_ms = if raw > prev { att_ms } else { rel_ms };
                     let coef = (-dt / (tau_ms.max(0.1) / 1000.0)).exp();

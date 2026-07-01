@@ -20,8 +20,6 @@ const els = isPanel
       mouth: document.getElementById("mouth"),
       eyes: document.getElementById("eyes"),
       clearBtn: document.getElementById("clear"),
-      stageUrlEl: document.getElementById("stage-url"),
-      copyBtn: document.getElementById("copy-stage-url"),
       toast: document.getElementById("toast"),
       tuningToggle: document.getElementById("tuning-toggle"),
       tuning: document.getElementById("tuning"),
@@ -56,29 +54,41 @@ function wsUrl() {
 }
 
 // --- Webcam preview: read the virtual camera back via getUserMedia ---------
-// The avatar is already on the v4l2loopback device; we just display it here.
-// Camera access needs a user gesture + permission, hence the button.
+// Read the virtual camera back like any webcam. Camera access needs a user
+// gesture + permission, hence the button. We open the default camera first so
+// the preview always works, then try to switch to the Rusty-Tuber device.
 async function enablePreview() {
   if (!navigator.mediaDevices?.getUserMedia) {
     showToast("Camera API unavailable (needs HTTPS or localhost).");
     return;
   }
+  let stream;
   try {
-    // A first getUserMedia to obtain permission (device labels need it).
-    let stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
-    stream.getTracks().forEach((t) => t.stop());
-    // Prefer the "Rusty-Tuber" device if present, else the first camera.
-    const devs = await navigator.mediaDevices.enumerateDevices();
-    const cams = devs.filter((d) => d.kind === "videoinput");
-    const pick = cams.find((d) => (d.label || "").includes("Rusty-Tuber")) || cams[0];
-    stream = await navigator.mediaDevices.getUserMedia({
-      video: pick ? { deviceId: { exact: pick.deviceId } } : true,
-      audio: false,
-    });
-    previewVideo.srcObject = stream;
-    previewBtn.hidden = true;
+    stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
   } catch (e) {
-    showToast("Preview failed: " + (e?.message || e));
+    showToast("Camera access denied or unavailable: " + (e?.message || e));
+    return;
+  }
+  previewVideo.srcObject = stream;
+  previewBtn.hidden = true;
+
+  // Prefer the Rusty-Tuber device if the default wasn't it. Don't drop the
+  // working stream until the switch succeeds.
+  try {
+    const cams = await navigator.mediaDevices.enumerateDevices();
+    const rt = cams.find((d) => d.kind === "videoinput" && (d.label || "").includes("Rusty-Tuber"));
+    const current = stream.getVideoTracks()[0]?.label;
+    if (rt && rt.label !== current) {
+      const better = await navigator.mediaDevices.getUserMedia({
+        video: { deviceId: { exact: rt.deviceId } },
+        audio: false,
+      });
+      stream.getTracks().forEach((t) => t.stop());
+      previewVideo.srcObject = better;
+    }
+  } catch {
+    // Keep the default camera; just note the switch didn't take.
+    showToast("Showing default camera (couldn't switch to Rusty-Tuber).");
   }
 }
 
@@ -520,20 +530,6 @@ if (isPanel) {
   });
 }
 
-if (isPanel && els.stageUrlEl) {
-  els.stageUrlEl.textContent = `${location.origin}/stage.html`;
-}
-if (isPanel && els.copyBtn) {
-  els.copyBtn.onclick = async () => {
-    const url = els.stageUrlEl.textContent;
-    try {
-      await navigator.clipboard.writeText(url);
-      showToast("Stage URL copied");
-    } catch {
-      showToast("Copy failed — select the URL manually");
-    }
-  };
-}
 if (isPanel && els.tuningToggle) {
   els.tuningToggle.onclick = () => {
     const open = els.tuning.hasAttribute("hidden");

@@ -58,9 +58,6 @@ pub struct AppState {
     pub envelope: Arc<RwLock<EnvelopeConfig>>,
     /// Audio latency preset in use ("low" / "stable") — surfaced in `Welcome`.
     pub latency: String,
-    /// Composited frame dimensions — surfaced in `Welcome` for info.
-    pub frame_width: u32,
-    pub frame_height: u32,
     /// Limits concurrent WebSocket clients to [`MAX_WS_CLIENTS`].
     pub ws_permits: Arc<Semaphore>,
 }
@@ -77,8 +74,6 @@ impl AppState {
         mouth_config: Arc<RwLock<MouthConfig>>,
         envelope: Arc<RwLock<EnvelopeConfig>>,
         latency: String,
-        frame_width: u32,
-        frame_height: u32,
     ) -> Self {
         Self {
             catalog,
@@ -89,8 +84,6 @@ impl AppState {
             mouth_config,
             envelope,
             latency,
-            frame_width,
-            frame_height,
             ws_permits: Arc::new(Semaphore::new(MAX_WS_CLIENTS)),
         }
     }
@@ -489,8 +482,6 @@ async fn handle_ws(socket: WebSocket, st: Arc<AppState>) {
         mouth_config: st.mouth_config.read().await.clone(),
         envelope: st.envelope.read().await.clone(),
         latency: st.latency.clone(),
-        frame_width: st.frame_width,
-        frame_height: st.frame_height,
     };
     if send_server_message(&mut sink, &welcome).await.is_err() {
         return;

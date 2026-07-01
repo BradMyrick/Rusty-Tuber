@@ -1,13 +1,10 @@
 //! Virtual webcam sink (Linux v4l2loopback).
 //!
-//! Consumes the compositor's RGBA frame, composites the avatar over a chroma
-//! background (the webcam is opaque — there is no alpha over video devices), and
-//! writes BGR4 (32-bit BGRA) frames to a `/dev/videoN` v4l2loopback device at a
-//! steady fps. BGR4 is v4l2loopback's native format and is trivially produced
-//! from RGBA (swap R/B), so the output works in OBS/Chrome/Zoom/Discord as a
-//! normal camera. For OBS, add a **Chroma Key** filter on this source to key
-//! out the background colour and recover transparency; the transparent OBS
-//! Browser Source remains available alongside.
+//! Composites the compositor's RGBA frame over a chroma background (video
+//! devices carry no alpha) and writes BGR4 frames to a `/dev/videoN`
+//! v4l2loopback device, so the avatar appears as a normal camera in OBS,
+//! browsers, and conferencing apps. Consumers apply a chroma-key filter to drop
+//! the background.
 
 #![cfg(target_os = "linux")]
 
@@ -20,7 +17,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::watch;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 // v4l2 constants we need (avoid pulling a full v4l2 binding crate).
 const V4L2_BUF_TYPE_VIDEO_OUTPUT: u32 = 2;
@@ -45,36 +42,53 @@ const fn ioc(dir: u32, type_: u8, nr: u32, size: u32) -> libc::c_ulong {
         | ((nr & 0xFF) as libc::c_ulong)
 }
 
-/// Find a v4l2loopback `/dev/videoN`. If `configured` is set, use it directly.
-/// Otherwise scan `/sys/class/video4linux/`: a device is a candidate when its
-/// `name` mentions v4l2loopback / "Dummy video device", OR it has no `device`
-/// symlink (virtual devices have no physical bus, real webcams do). This catches
-/// devices created with a custom `card_label` (e.g. `Rusty-Tuber`) too. Every
-/// video device + its name is logged to help diagnose misses.
+/// Resolve the webcam device: an explicit `configured` path, else auto-detect.
+///
+/// Auto-detection scans `/sys/class/video4linux/` and picks the first device
+/// whose `name` mentions v4l2loopback / "Dummy video", or — failing that — any
+/// named device with no `device` symlink (virtual devices have no physical bus,
+/// real webcams do). This recognises devices created with a custom `card_label`.
 pub fn find_device(configured: &str) -> Option<PathBuf> {
     if !configured.is_empty() {
         return Some(PathBuf::from(configured));
     }
-    let mut found: Option<PathBuf> = None;
-    for n in 0..64 {
-        let base = format!("/sys/class/video4linux/video{n}");
-        let name_path = format!("{base}/name");
-        let name = fs::read_to_string(&name_path)
+
+    let entries = fs::read_dir("/sys/class/video4linux")
+        .map(|rd| {
+            rd.filter_map(|e| e.ok())
+                .map(|e| e.path())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    let mut found: Option<(PathBuf, String)> = None;
+    for dir in entries {
+        let Some(node) = dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(|s| s.strip_prefix("video"))
+        else {
+            continue;
+        };
+        let name = fs::read_to_string(dir.join("name"))
             .map(|s| s.trim().to_string())
             .unwrap_or_default();
         let lname = name.to_ascii_lowercase();
-        let is_loopback_name =
+        let named_loopback =
             lname.contains("v4l2loopback") || lname.contains("dummy video");
-        // Real (hardware-backed) devices have a `device` symlink to their bus;
-        // v4l2loopback devices don't.
-        let has_bus = std::path::Path::new(&format!("{base}/device")).exists();
-        let candidate = is_loopback_name || (!has_bus && !name.is_empty());
-        info!(node = %format!("/dev/video{n}"), name = %name, has_bus, "video device");
+        let has_bus = dir.join("device").exists();
+        let candidate = named_loopback || (!has_bus && !name.is_empty());
+
+        debug!(node = %format!("/dev/video{node}"), %name, has_bus, "video device");
         if candidate && found.is_none() {
-            found = Some(PathBuf::from(format!("/dev/video{n}")));
+            found = Some((PathBuf::from(format!("/dev/video{node}")), name));
         }
     }
-    found
+
+    if let Some((dev, name)) = &found {
+        info!(device = %dev.display(), name = %name, "auto-detected v4l2loopback device");
+    }
+    found.map(|(d, _)| d)
 }
 
 /// Open and configure the device for BGR4 output. The returned fd is kept for
@@ -142,16 +156,15 @@ fn write_u32(buf: &mut [u8], offset: usize, val: u32) {
 /// Spawn the webcam render loop on a dedicated OS thread (keeps the per-frame
 /// How long after the last visible change we keep writing at the active (high)
 /// frame rate before dropping to the idle rate. Covers natural pauses between
-/// words/sentences so the camera doesn't visibly stutter down to idle mid-talk.
+/// Active-rate hold time after the last visible change, so the camera doesn't
+/// stutter down to idle mid-pause.
 const ACTIVE_WINDOW: Duration = Duration::from_millis(350);
 
-/// Spawn the webcam render loop on a dedicated OS thread (keeps the per-frame
-/// CPU + blocking write() off the async runtime). Exits when the frame channel
-/// closes (server shutdown).
+/// Spawn the webcam loop on a dedicated thread (keeps the per-frame CPU and
+/// blocking `write()` off the async runtime).
 ///
-/// Runs at `fps` while the avatar is actively changing (and for `ACTIVE_WINDOW`
-/// after the last change), then drops to `idle_fps` while static — keeping the
-/// feed alive for consumers without burning CPU at full rate during silence.
+/// Writes at `fps` while the avatar is changing and for `ACTIVE_WINDOW`
+/// afterward, then at `idle_fps` while static.
 pub fn spawn_webcam(
     frame_rx: watch::Receiver<Arc<Frame>>,
     device: PathBuf,
@@ -159,8 +172,6 @@ pub fn spawn_webcam(
     idle_fps: u32,
     bg: [u8; 3],
 ) -> Result<()> {
-    // Use the compositor frame's native dimensions (BGR4 is 32-bit/pixel, so no
-    // even-width constraint).
     let initial = frame_rx.borrow().clone();
     let out_w = initial.width;
     let out_h = initial.height;
@@ -173,7 +184,7 @@ pub fn spawn_webcam(
         height = out_h,
         fps,
         idle_fps,
-        "virtual webcam output started (BGR4); add a Chroma Key filter in OBS to key out the background"
+        "virtual webcam output started (BGR4)"
     );
 
     std::thread::spawn(move || {

@@ -85,8 +85,6 @@ async fn spawn_server() -> String {
             release_ms: 110.0,
         })),
         "low".into(),
-        921,
-        921,
     ));
     let _rec = net::spawn_snapshot_recorder(app_state.clone());
     let app = net::build_router(app_state, &cfg.engine.asset_root);

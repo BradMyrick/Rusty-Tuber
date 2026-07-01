@@ -110,10 +110,6 @@ impl Compositor {
         })
     }
 
-    pub fn dimensions(&self) -> (u32, u32) {
-        (self.width, self.height)
-    }
-
     /// Composite the avatar for the current state. Copies the pre-composited
     /// base (cheap memcpy) then overlays the eye + mouth layers with a
     /// skip-transparent blit — those layers are sparse, so most pixels are

@@ -54,7 +54,6 @@ pub async fn run(cfg: config::AppConfig) -> Result<()> {
         catalog.clone(),
         &cfg.engine.asset_root,
     )?);
-    let (cw, ch) = compositor.dimensions();
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<state::StateCommand>();
     let (bcast_tx, _) = broadcast::channel::<protocol::ServerMessage>(256);
 
@@ -106,8 +105,6 @@ pub async fn run(cfg: config::AppConfig) -> Result<()> {
             release_ms: cfg.audio.release_ms,
         })),
         format!("{:?}", cfg.audio.latency).to_ascii_lowercase(),
-        cw,
-        ch,
     ));
     let _recorder = net::spawn_snapshot_recorder(app_state.clone());
     #[cfg(target_os = "linux")]

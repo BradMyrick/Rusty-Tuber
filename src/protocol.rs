@@ -268,18 +268,14 @@ pub enum ClientMessage {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "payload", rename_all = "PascalCase")]
 pub enum ServerMessage {
-    /// Sent once on (re)connect: the full layered asset catalog (for the panel
-    /// UI), the current resting emotion, the mouth-level configuration, and the
-    /// composited frame dimensions (so the client sizes its canvas for the raw
-    /// RGBA frames it receives over the binary WS channel).
+    /// Sent once on (re)connect: the catalog (for the panel UI), the current
+    /// resting emotion, mouth + envelope config, and the active latency preset.
     Welcome {
         catalog: LayerCatalog,
         default_emotion: String,
         mouth_config: MouthConfig,
         envelope: EnvelopeConfig,
         latency: String,
-        frame_width: u32,
-        frame_height: u32,
     },
     /// Authoritative avatar state. Sent on every change and throttled for
     /// volume-only drift. `eyes_frame` / `mouth_frame` are the resolved layer
@@ -407,8 +403,6 @@ mod tests {
                 release_ms: 110.0,
             },
             latency: "low".into(),
-            frame_width: 921,
-            frame_height: 921,
         };
         let s = serde_json::to_string(&welcome).unwrap();
         let back: ServerMessage = serde_json::from_str(&s).unwrap();
@@ -416,12 +410,10 @@ mod tests {
             ServerMessage::Welcome {
                 catalog,
                 default_emotion,
-                frame_width,
                 ..
             } => {
                 assert_eq!(catalog.base, vec!["base/body.png".to_string()]);
                 assert_eq!(default_emotion, "default");
-                assert_eq!(frame_width, 921);
             }
             _ => panic!("wrong variant"),
         }
