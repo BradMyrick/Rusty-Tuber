@@ -4,6 +4,7 @@
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>Rusty-Tuber Control</title>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml" />
 <style>
   :root { color-scheme: dark; }
   * { box-sizing: border-box; }
@@ -15,13 +16,11 @@
   }
   main {
     display: grid;
-    grid-template-columns: 1fr 320px;
+    grid-template-columns: 1fr 340px;
     height: 100vh;
   }
   #stage-wrap {
-    display: flex;
-    align-items: center;
-    justify-content: center;
+    position: relative;
     background:
       linear-gradient(45deg, #161b22 25%, transparent 25%) -20px 0/40px 40px,
       linear-gradient(-45deg, #161b22 25%, transparent 25%) -20px 0/40px 40px,
@@ -29,22 +28,55 @@
       linear-gradient(-45deg, transparent 75%, #161b22 75%) 0 0/40px 40px,
       #0d1117;
   }
-  #avatar { max-width: 100%; max-height: 100%; object-fit: contain; }
+  /* The avatar is a stack of same-size transparent PNGs (base, eyes, mouth).
+     Each layer fills the stage and is letterboxed identically via
+     object-fit:contain, so the layers align pixel-perfect. */
+  .layer {
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    object-fit: contain;
+    pointer-events: none;
+  }
   #controls {
     padding: 16px;
     border-left: 1px solid #21262d;
-    background: #010409;
+    background: #0d1117;
     overflow-y: auto;
     display: flex;
     flex-direction: column;
     gap: 14px;
   }
   h1 { font-size: 16px; margin: 0; display: flex; align-items: center; gap: 8px; }
-  #dot { width: 10px; height: 10px; border-radius: 50%; background: #f85149; box-shadow: 0 0 6px #f85149; }
+  h1 #conn-text { font-size: 11px; color: #7d8590; font-weight: 400; }
+  #dot {
+    width: 10px; height: 10px; border-radius: 50%;
+    background: #f85149; box-shadow: 0 0 6px #f85149;
+  }
   #dot.ok { background: #3fb950; box-shadow: 0 0 6px #3fb950; }
-  .label { font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: #7d8590; }
-  #meter { height: 10px; background: #21262d; border-radius: 6px; overflow: hidden; }
-  #meter-fill { height: 100%; width: 0%; background: linear-gradient(90deg, #2f81f7, #a371f7); transition: width 60ms linear; }
+  /* Card grouping: each control section is a labelled fieldset. */
+  .card {
+    border: 1px solid #21262d;
+    background: #010409;
+    border-radius: 10px;
+    padding: 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+  .card h2 {
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: .06em;
+    color: #7d8590;
+    margin: 0;
+    font-weight: 600;
+  }
+  #meter { position: relative; height: 12px; background: #21262d; border-radius: 6px; overflow: hidden; }
+  #meter-fill { position: absolute; inset: 0; width: 0%; background: linear-gradient(90deg, #2f81f7, #a371f7); transition: width 60ms linear; }
+  #meter-peak { position: absolute; top: 0; bottom: 0; width: 0%; border-right: 2px solid #e6edf3; transition: width 120ms linear; opacity: .7; }
   .btn-row { display: flex; flex-wrap: wrap; gap: 6px; }
   button {
     background: #21262d;
@@ -54,45 +86,167 @@
     padding: 8px 12px;
     cursor: pointer;
     font: inherit;
+    min-height: 36px;
     transition: background 80ms, border-color 80ms;
   }
   button:hover { background: #30363d; }
+  button:focus-visible {
+    outline: 2px solid #1f6feb;
+    outline-offset: 1px;
+  }
   button.active { background: #1f6feb; border-color: #1f6feb; }
-  button.default-emo { border-color: #3fb950; }
-  .mouth button.auto { border-style: dashed; }
-  .hint { color: #7d8590; font-size: 12px; }
-  code { background: #161b22; padding: 1px 5px; border-radius: 4px; }
+  .btn-row button.auto { border-style: dashed; }
+  #emotions { display: flex; flex-wrap: wrap; gap: 6px; }
+  .emotion-cell {
+    display: inline-flex;
+    align-items: stretch;
+    border: 1px solid #30363d;
+    border-radius: 6px;
+    overflow: hidden;
+  }
+  .emotion-cell .emotion-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    border: none;
+    border-radius: 0;
+    background: #21262d;
+  }
+  .emotion-cell .emotion-btn:hover { background: #30363d; }
+  .emotion-cell.is-active .emotion-btn { background: #1f6feb; }
+  .emotion-cell .star {
+    border: none;
+    border-left: 1px solid #30363d;
+    border-radius: 0;
+    padding: 8px 8px;
+    color: #7d8590;
+    background: #161b22;
+    line-height: 1;
+    font-size: 13px;
+  }
+  .emotion-cell .star:hover { color: #e6edf3; background: #21262d; }
+  .emotion-cell.is-default .star { color: #3fb950; }
+  kbd.hotkey {
+    display: inline-block;
+    min-width: 16px;
+    padding: 0 4px;
+    margin-left: 2px;
+    background: rgba(255,255,255,.08);
+    border: 1px solid rgba(255,255,255,.15);
+    border-bottom-width: 2px;
+    border-radius: 4px;
+    font: 10px/1.6 ui-monospace, SFMono-Regular, monospace;
+    color: #7d8590;
+    text-align: center;
+  }
+  .hint { color: #7d8590; font-size: 12px; line-height: 1.7; }
+  .hint-inline { color: #7d8590; font-size: 11px; font-weight: 400; text-transform: none; letter-spacing: 0; }
+  .hint code { background: #161b22; padding: 1px 5px; border-radius: 4px; }
+  .copy-btn { padding: 2px 8px; font-size: 12px; min-height: 0; }
+  /* Mouth tuning card */
+  .tuning { display: flex; flex-direction: column; gap: 10px; }
+  .levels { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 4px; }
+  .level-chip {
+    display: inline-flex; align-items: center; gap: 5px;
+    border: 1px solid #30363d; border-radius: 6px;
+    padding: 3px 8px; background: #161b22; font-size: 12px;
+    cursor: pointer; user-select: none;
+  }
+  .level-chip input { accent-color: #1f6feb; }
+  .level-chip.is-resting { border-color: #3fb950; }
+  .thresholds { display: flex; flex-direction: column; gap: 6px; margin-top: 4px; }
+  .threshold { display: grid; grid-template-columns: 64px 1fr 34px; align-items: center; gap: 8px; font-size: 12px; }
+  .threshold input[type=range] { width: 100%; accent-color: #1f6feb; }
+  .threshold .tv { text-align: right; color: #7d8590; font-variant-numeric: tabular-nums; }
+  #toast {
+    position: fixed;
+    left: 50%;
+    bottom: 24px;
+    transform: translate(-50%, 20px);
+    background: #1f6feb;
+    color: #e6edf3;
+    padding: 10px 16px;
+    border-radius: 8px;
+    box-shadow: 0 4px 16px rgba(0,0,0,.5);
+    font-size: 13px;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 160ms, transform 160ms;
+    max-width: 80vw;
+  }
+  #toast.show { opacity: 1; transform: translate(-50%, 0); }
+
+  /* Stream-Deck-from-a-phone: stack the stage above the controls so the panel
+     is usable on narrow screens instead of collapsing to a sliver. */
+  @media (max-width: 760px) {
+    main { grid-template-columns: 1fr; grid-template-rows: 1fr auto; }
+    #stage-wrap { min-height: 0; }
+    #controls {
+      border-left: none;
+      border-top: 1px solid #21262d;
+      max-height: 55vh;
+    }
+    button { min-height: 44px; }
+    .emotion-cell .star { min-height: 44px; }
+  }
 </style>
 </head>
 <body data-mode="panel">
   <main>
-    <section id="stage-wrap"><img id="avatar" alt="avatar" /></section>
+    <section id="stage-wrap" aria-label="avatar preview">
+      <img id="layer-eyes" class="layer" alt="avatar, loading" />
+      <img id="layer-mouth" class="layer" alt="" />
+    </section>
     <section id="controls">
-      <h1><span id="dot"></span> Rusty-Tuber</h1>
-      <div>
-        <div class="label">Volume</div>
-        <div id="meter"><div id="meter-fill"></div></div>
+      <h1><span id="dot" role="status" aria-label="connection status"></span> Rusty-Tuber <span id="conn-text">connecting…</span></h1>
+
+      <div class="card">
+        <h2>Volume</h2>
+        <div id="meter" role="meter" aria-label="microphone volume" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><div id="meter-fill"></div><div id="meter-peak"></div></div>
       </div>
-      <div>
-        <div class="label">Emotions</div>
-        <div id="emotions" class="btn-row"></div>
+
+      <div class="card">
+        <h2>Emotions (click to trigger, ★ to set resting)</h2>
+        <div id="emotions" class="btn-row" role="group" aria-label="emotions"></div>
+        <div class="btn-row"><button id="clear" title="Return to the resting emotion now">Clear override<kbd class="hotkey">0</kbd></button></div>
       </div>
-      <div class="btn-row">
-        <button id="clear" title="Return to the resting emotion now">Clear override</button>
+
+      <div class="card">
+        <h2>Mouth (overrides mic)</h2>
+        <div id="mouth" class="btn-row" role="group" aria-label="mouth override"></div>
       </div>
-      <div>
-        <div class="label">Mouth (overrides mic)</div>
-        <div id="mouth" class="btn-row mouth"></div>
+
+      <div class="card">
+        <h2>Eyes (overrides blink)</h2>
+        <div id="eyes" class="btn-row" role="group" aria-label="eyes override"></div>
       </div>
-      <div>
-        <div class="label">Eyes (overrides blink)</div>
-        <div id="eyes" class="btn-row eyes"></div>
+
+      <div class="card">
+        <h2>Mouth tuning <span class="hint-inline">(levels &amp; thresholds)</span>
+          <button id="tuning-toggle" class="copy-btn" aria-expanded="false">show</button>
+        </h2>
+        <div id="tuning" class="tuning" hidden>
+          <div>
+            <span class="label">Active levels (lowest = resting)</span>
+            <div id="mouth-levels" class="levels" role="group" aria-label="mouth levels"></div>
+          </div>
+          <div>
+            <span class="label">Pick-up thresholds (% volume)</span>
+            <div id="thresholds" class="thresholds"></div>
+          </div>
+        </div>
       </div>
+
       <div class="hint">
         OBS Browser Source: point at <code id="stage-url"></code>
+        <button id="copy-stage-url" class="copy-btn" title="Copy the stage URL">Copy</button><br />
+        Shortcuts: <kbd class="hotkey">1</kbd>–<kbd class="hotkey">9</kbd> emotions,
+        <kbd class="hotkey">0</kbd> clear, <kbd class="hotkey">M</kbd> mouth,
+        <kbd class="hotkey">E</kbd> eyes, <kbd class="hotkey">D</kbd> set current as resting.
       </div>
     </section>
   </main>
+  <div id="toast" role="alert" aria-live="assertive"></div>
   <script src="app.js"></script>
 </body>
 </html>

@@ -23,6 +23,7 @@ use cpal::{
     Device, SampleFormat, SampleRate, Stream, StreamConfig,
     SupportedStreamConfig,
 };
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc::UnboundedSender;
@@ -178,26 +179,34 @@ pub fn start(
     );
 
     let smoothing_init = audio.smoothing_factor.clamp(0.0, 1.0);
-    let alpha = Arc::new(AtomicU32::new(smoothing_init.to_bits()));
+    // Smoothing weight is fixed for the lifetime of this stream (captured by
+    // value into the callback). Live tuning would require a shared atomic and a
+    // command path; left as a future feature when a calibration UI exists.
     let smoothed: Arc<AtomicU32> = Arc::new(AtomicU32::new(0.0f32.to_bits()));
 
     let err_cb = |err| warn!(error = %err, "audio stream error");
 
     let build = |cfg: StreamConfig| {
         let smoothed = smoothed.clone();
-        let alpha_v = f32::from_bits(alpha.load(Ordering::Relaxed));
+        let alpha_v = smoothing_init;
         let cmd_tx = cmd_tx.clone();
         let fmt = sample_format;
         device.build_input_stream_raw(
             &cfg,
             fmt,
             move |data, _info| {
-                let raw = compute_rms(data.bytes(), fmt);
-                let prev = f32::from_bits(smoothed.load(Ordering::Relaxed));
-                let next = alpha_v * raw + (1.0 - alpha_v) * prev;
-                smoothed.store(next.to_bits(), Ordering::Relaxed);
-                // UnboundedSender::send is synchronous and non-blocking.
-                let _ = cmd_tx.send(StateCommand::SetVolume(next));
+                // cpal backends don't guarantee catch_unwind around user
+                // callbacks on every platform; wrap the body so a panic can't
+                // unwind across the realtime -> FFI boundary (UB). A failed
+                // buffer is treated as silence for that callback.
+                let _ = catch_unwind(AssertUnwindSafe(|| {
+                    let raw = compute_rms(data.bytes(), fmt);
+                    let prev = f32::from_bits(smoothed.load(Ordering::Relaxed));
+                    let next = alpha_v * raw + (1.0 - alpha_v) * prev;
+                    smoothed.store(next.to_bits(), Ordering::Relaxed);
+                    // UnboundedSender::send is synchronous and non-blocking.
+                    let _ = cmd_tx.send(StateCommand::SetVolume(next));
+                }));
             },
             err_cb,
             None,
@@ -288,12 +297,16 @@ fn as_u8(b: &[u8]) -> &[u8] {
 
 /// Reinterpret a byte slice as a typed sample slice via std `align_to`. cpal
 /// guarantees the buffer is aligned and sized to whole samples for the active
-/// format, so the head/tail byte remainders are empty.
+/// format; if a backend ever hands us a malformed buffer we return an empty
+/// slice (silence) rather than panicking inside the realtime callback.
 fn cast_slice<T: Copy>(b: &[u8]) -> &[T] {
     // SAFETY: cpal guarantees the callback buffer is aligned and sized to whole
-    // samples of the active format. We assert the head/tail remainders are empty.
+    // samples of the active format. We still guard the head/tail remainders:
+    // a non-empty remainder means the buffer is malformed, so return silence.
     let (head, mid, tail) = unsafe { b.align_to::<T>() };
-    debug_assert!(head.is_empty() && tail.is_empty(), "unaligned cpal buffer");
+    if !head.is_empty() || !tail.is_empty() {
+        return &[];
+    }
     mid
 }
 

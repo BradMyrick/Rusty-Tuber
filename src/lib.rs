@@ -25,25 +25,34 @@ pub async fn run(cfg: config::AppConfig) -> Result<()> {
     let catalog = Arc::new(assets::AssetCatalog::load(&cfg.engine.asset_root)?);
     info!(
         emotions = ?catalog.emotions().collect::<Vec<_>>(),
+        base = ?catalog.catalog().base,
         "loaded asset catalog"
     );
-    if catalog.get(&cfg.engine.default_emotion).is_none() {
+    // Resolve the resting emotion: an empty value or a known emotion is used
+    // as-is (empty means the base/default eyes); an unknown name falls back to
+    // the default eyes with a warning.
+    let default_emotion = if cfg.engine.default_emotion.is_empty()
+        || catalog.has_emotion(&cfg.engine.default_emotion)
+    {
+        cfg.engine.default_emotion.clone()
+    } else {
         warn!(
-            default = %cfg.engine.default_emotion,
-            "configured default emotion is not present in the catalog; \
-             triggers of unknown emotions will be rejected"
+            configured = %cfg.engine.default_emotion,
+            "configured default emotion is not in the catalog; using the default eyes"
         );
-    }
+        String::new()
+    };
 
     // --- Channels & state task ---------------------------------------------
+    let mouth_config = cfg.thresholds.to_mouth_config()?;
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<state::StateCommand>();
     let (bcast_tx, _) = broadcast::channel::<protocol::ServerMessage>(256);
 
     let state_handle = state::spawn(
         catalog.clone(),
-        cfg.thresholds,
+        mouth_config.clone(),
         cfg.timers.clone(),
-        cfg.engine.default_emotion.clone(),
+        default_emotion.clone(),
         cmd_tx.clone(),
         cmd_rx,
         bcast_tx.clone(),
@@ -54,13 +63,14 @@ pub async fn run(cfg: config::AppConfig) -> Result<()> {
     state::spawn_blink_scheduler(cmd_tx.clone(), cfg.blink.clone());
 
     // --- Shared HTTP/WS state ----------------------------------------------
-    let app_state = Arc::new(net::AppState {
-        catalog: catalog.clone(),
-        default_emotion: cfg.engine.default_emotion.clone(),
-        cmd_tx: cmd_tx.clone(),
-        bcast_tx: bcast_tx.clone(),
-        snapshot: Arc::new(RwLock::new(None)),
-    });
+    let app_state = Arc::new(net::AppState::new(
+        catalog.clone(),
+        default_emotion,
+        cmd_tx.clone(),
+        bcast_tx.clone(),
+        Arc::new(RwLock::new(None)),
+        Arc::new(RwLock::new(mouth_config)),
+    ));
     let _recorder = net::spawn_snapshot_recorder(app_state.clone());
 
     // --- Audio capture (dedicated OS thread; cpal Stream lives there) -------

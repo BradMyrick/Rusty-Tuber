@@ -1,5 +1,5 @@
 //! End-to-end tests for the HTTP + WebSocket surface (`net.rs`) wired to the
-//! real state task and the project's own asset catalog.
+//! real state task and the project's own layered asset catalog.
 
 use futures_util::{SinkExt, StreamExt};
 use rusty_tuber::{assets, config, net, state};
@@ -13,24 +13,31 @@ async fn spawn_server() -> String {
         .unwrap();
     let catalog =
         Arc::new(assets::AssetCatalog::load(&cfg.engine.asset_root).unwrap());
+    let mouth_config = cfg.thresholds.to_mouth_config().unwrap();
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     let (bcast_tx, _) = broadcast::channel(256);
+    let default_emotion = if catalog.has_emotion(&cfg.engine.default_emotion) {
+        cfg.engine.default_emotion.clone()
+    } else {
+        String::new()
+    };
     let _state = state::spawn(
         catalog.clone(),
-        cfg.thresholds,
+        mouth_config.clone(),
         cfg.timers.clone(),
-        cfg.engine.default_emotion.clone(),
+        default_emotion.clone(),
         cmd_tx.clone(),
         cmd_rx,
         bcast_tx.clone(),
     );
-    let app_state = Arc::new(net::AppState {
-        catalog: catalog.clone(),
-        default_emotion: cfg.engine.default_emotion.clone(),
-        cmd_tx: cmd_tx.clone(),
-        bcast_tx: bcast_tx.clone(),
-        snapshot: Arc::new(RwLock::new(None)),
-    });
+    let app_state = Arc::new(net::AppState::new(
+        catalog.clone(),
+        default_emotion,
+        cmd_tx.clone(),
+        bcast_tx.clone(),
+        Arc::new(RwLock::new(None)),
+        Arc::new(RwLock::new(mouth_config)),
+    ));
     let _rec = net::spawn_snapshot_recorder(app_state.clone());
     let app = net::build_router(app_state, &cfg.engine.asset_root);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -46,7 +53,7 @@ fn http() -> reqwest::Client {
 }
 
 #[tokio::test]
-async fn rest_catalog_lists_all_emotions() {
+async fn rest_catalog_lists_layers() {
     let base = spawn_server().await;
     let body: serde_json::Value = http()
         .get(format!("{base}/api/catalog"))
@@ -56,35 +63,76 @@ async fn rest_catalog_lists_all_emotions() {
         .json()
         .await
         .unwrap();
-    let emotions = body["emotions"].as_array().unwrap();
-    let names: Vec<&str> =
-        emotions.iter().map(|v| v.as_str().unwrap()).collect();
-    assert!(names.contains(&"calm"));
-    assert!(names.contains(&"surprised"));
-    // calm: full eyes-open set + eyes-closed (blink) set
+    // Layered catalog: base body + mouths + default eyes.
+    assert!(!body["base"].as_array().unwrap().is_empty());
+    assert_eq!(body["mouths"]["closed"].as_str(), Some("mouths/closed.png"));
+    assert_eq!(body["mouths"]["open"].as_str(), Some("mouths/open.png"));
+    assert_eq!(body["default_eyes"]["open"].as_str(), Some("eyes/open.png"));
     assert_eq!(
-        body["frames"]["calm"]["eyes_open"]["slight"].as_str(),
-        Some("calm/slight.png")
+        body["default_eyes"]["closed"].as_str(),
+        Some("eyes/closed.png")
     );
+    // No emotion eye-sets shipped with the placeholder art.
+    assert!(body["emotions"].as_object().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn rest_health_returns_ok() {
+    let base = spawn_server().await;
+    let body: serde_json::Value = http()
+        .get(format!("{base}/api/health"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(body["status"].as_str(), Some("ok"));
+}
+
+#[tokio::test]
+async fn rest_unknown_emotion_is_404_json() {
+    let base = spawn_server().await;
+    let resp = http()
+        .post(format!("{base}/api/emotion/does-not-exist"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 404);
     assert_eq!(
-        body["frames"]["calm"]["eyes_closed"]["closed"].as_str(),
-        Some("calm/closed-blink.png")
+        resp.headers().get("content-type").unwrap(),
+        "application/json"
     );
-    // surprised: eyes-open has only closed/open; eyes-closed (blink) has closed+open
-    assert!(body["frames"]["surprised"]["eyes_open"]["slight"].is_null());
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(body["error"].as_str().unwrap().contains("unknown emotion"));
+}
+
+#[tokio::test]
+async fn rest_state_synthesises_resting_layers() {
+    let base = spawn_server().await;
+    let st: serde_json::Value = http()
+        .get(format!("{base}/api/state"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(st["mouth"].as_str(), Some("closed"));
+    assert_eq!(st["eyes"].as_str(), Some("open"));
+    assert_eq!(st["eyes_frame"].as_str(), Some("/frames/eyes/open.png"));
     assert_eq!(
-        body["frames"]["surprised"]["eyes_closed"]["closed"].as_str(),
-        Some("surprised/closed-blink.png")
+        st["mouth_frame"].as_str(),
+        Some("/frames/mouths/closed.png")
     );
 }
 
 #[tokio::test]
-async fn rest_trigger_then_revert_via_timer() {
+async fn rest_mouth_override_swaps_mouth_layer() {
     let base = spawn_server().await;
     let client = http();
-
     let status = client
-        .post(format!("{base}/api/emotion/surprised"))
+        .post(format!("{base}/api/mouth/open"))
         .send()
         .await
         .unwrap()
@@ -99,127 +147,25 @@ async fn rest_trigger_then_revert_via_timer() {
         .json()
         .await
         .unwrap();
-    assert_eq!(st["emotion"].as_str(), Some("surprised"));
-    assert_eq!(st["overridden"].as_bool(), Some(true));
+    assert_eq!(st["mouth"].as_str(), Some("open"));
+    assert_eq!(st["mouth_frame"].as_str(), Some("/frames/mouths/open.png"));
+    assert_eq!(st["mouth_overridden"].as_bool(), Some(true));
 
-    // Timer is 2.5s; wait for the auto-revert.
-    tokio::time::sleep(std::time::Duration::from_millis(2800)).await;
-    let st: serde_json::Value = client
-        .get(format!("{base}/api/state"))
+    // Invalid level is rejected.
+    let status = client
+        .post(format!("{base}/api/mouth/grin"))
         .send()
         .await
         .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert_eq!(
-        st["emotion"].as_str(),
-        Some("calm"),
-        "should have reverted to the default"
-    );
+        .status();
+    assert_eq!(status.as_u16(), 400);
 }
 
 #[tokio::test]
-async fn rest_unknown_emotion_is_404() {
-    let base = spawn_server().await;
-    let status = client_post_404(&base, "does-not-exist").await;
-    assert_eq!(status.as_u16(), 404);
-}
-
-async fn client_post_404(base: &str, emotion: &str) -> reqwest::StatusCode {
-    http()
-        .post(format!("{base}/api/emotion/{emotion}"))
-        .send()
-        .await
-        .unwrap()
-        .status()
-}
-
-#[tokio::test]
-async fn ws_welcome_and_state_update() {
-    let base = spawn_server().await;
-    let ws_url = base.replacen("http://", "ws://", 1) + "/ws";
-    let (mut socket, _) = connect_async(&ws_url).await.unwrap();
-
-    // First message must be Welcome with the catalog.
-    let welcome = serde_json::from_str::<serde_json::Value>(
-        &socket.next().await.unwrap().unwrap().into_text().unwrap(),
-    )
-    .unwrap();
-    assert_eq!(welcome["type"].as_str(), Some("Welcome"));
-    assert!(welcome["payload"]["catalog"]["calm"].is_object());
-
-    // Trigger an emotion and wait for a matching StateUpdate.
-    socket
-        .send(tokio_tungstenite::tungstenite::Message::Text(
-            r#"{"type":"TriggerEmotion","payload":{"emotion":"laughing"}}"#
-                .into(),
-        ))
-        .await
-        .unwrap();
-
-    let mut saw_laughing = false;
-    for _ in 0..20 {
-        let msg = serde_json::from_str::<serde_json::Value>(
-            &socket.next().await.unwrap().unwrap().into_text().unwrap(),
-        )
-        .unwrap();
-        if msg["type"].as_str() == Some("StateUpdate")
-            && msg["payload"]["emotion"].as_str() == Some("laughing")
-        {
-            assert_eq!(
-                msg["payload"]["frame"].as_str(),
-                Some("/frames/laughing/closed.png")
-            );
-            saw_laughing = true;
-            break;
-        }
-    }
-    assert!(saw_laughing, "should have received a laughing StateUpdate");
-}
-
-#[tokio::test]
-async fn ws_unknown_emotion_replies_error() {
-    let base = spawn_server().await;
-    let ws_url = base.replacen("http://", "ws://", 1) + "/ws";
-    let (mut socket, _) = connect_async(&ws_url).await.unwrap();
-    // consume Welcome
-    let _ = socket.next().await.unwrap().unwrap();
-
-    socket
-        .send(tokio_tungstenite::tungstenite::Message::Text(
-            r#"{"type":"TriggerEmotion","payload":{"emotion":"nope"}}"#.into(),
-        ))
-        .await
-        .unwrap();
-
-    let mut saw_error = false;
-    for _ in 0..20 {
-        let msg = serde_json::from_str::<serde_json::Value>(
-            &socket.next().await.unwrap().unwrap().into_text().unwrap(),
-        )
-        .unwrap();
-        if msg["type"].as_str() == Some("Error") {
-            assert!(msg["payload"]["message"]
-                .as_str()
-                .unwrap()
-                .contains("unknown emotion"));
-            saw_error = true;
-            break;
-        }
-    }
-    assert!(
-        saw_error,
-        "server should reject unknown emotions with an Error"
-    );
-}
-
-#[tokio::test]
-async fn rest_eyes_override_swaps_to_blink_frame() {
+async fn rest_eyes_override_swaps_eye_layer() {
     let base = spawn_server().await;
     let client = http();
 
-    // calm has blink art; forcing eyes closed should resolve to a *-blink frame.
     let status = client
         .post(format!("{base}/api/eyes/closed"))
         .send()
@@ -237,20 +183,7 @@ async fn rest_eyes_override_swaps_to_blink_frame() {
         .await
         .unwrap();
     assert_eq!(st["eyes"].as_str(), Some("closed"));
-    assert!(
-        st["frame"].as_str().unwrap().ends_with("-blink.png"),
-        "frame should be a blink variant, got {}",
-        st["frame"]
-    );
-
-    // Invalid state is rejected.
-    let status = client
-        .post(format!("{base}/api/eyes/squint"))
-        .send()
-        .await
-        .unwrap()
-        .status();
-    assert_eq!(status.as_u16(), 400);
+    assert_eq!(st["eyes_frame"].as_str(), Some("/frames/eyes/closed.png"));
 
     // Clearing returns to open eyes.
     client
@@ -267,10 +200,63 @@ async fn rest_eyes_override_swaps_to_blink_frame() {
         .await
         .unwrap();
     assert_eq!(st["eyes"].as_str(), Some("open"));
+    assert_eq!(st["eyes_frame"].as_str(), Some("/frames/eyes/open.png"));
 }
 
 #[tokio::test]
-async fn ws_eyes_override_via_protocol() {
+async fn ws_welcome_carries_layered_catalog() {
+    let base = spawn_server().await;
+    let ws_url = base.replacen("http://", "ws://", 1) + "/ws";
+    let (mut socket, _) = connect_async(&ws_url).await.unwrap();
+
+    let welcome = serde_json::from_str::<serde_json::Value>(
+        &socket.next().await.unwrap().unwrap().into_text().unwrap(),
+    )
+    .unwrap();
+    assert_eq!(welcome["type"].as_str(), Some("Welcome"));
+    assert!(
+        welcome["payload"]["catalog"]["base"].is_array(),
+        "catalog carries a base layer array"
+    );
+    assert!(welcome["payload"]["catalog"]["mouths"]["closed"].is_string());
+}
+
+#[tokio::test]
+async fn ws_mouth_override_emits_layered_state_update() {
+    let base = spawn_server().await;
+    let ws_url = base.replacen("http://", "ws://", 1) + "/ws";
+    let (mut socket, _) = connect_async(&ws_url).await.unwrap();
+    let _ = socket.next().await.unwrap(); // Welcome
+
+    socket
+        .send(tokio_tungstenite::tungstenite::Message::Text(
+            r#"{"type":"SetMouthOverride","payload":{"mouth":"open"}}"#.into(),
+        ))
+        .await
+        .unwrap();
+
+    let mut saw_open = false;
+    for _ in 0..20 {
+        let msg = serde_json::from_str::<serde_json::Value>(
+            &socket.next().await.unwrap().unwrap().into_text().unwrap(),
+        )
+        .unwrap();
+        if msg["type"].as_str() == Some("StateUpdate")
+            && msg["payload"]["mouth"].as_str() == Some("open")
+        {
+            assert_eq!(
+                msg["payload"]["mouth_frame"].as_str(),
+                Some("/frames/mouths/open.png")
+            );
+            saw_open = true;
+            break;
+        }
+    }
+    assert!(saw_open, "should have received an open-mouth StateUpdate");
+}
+
+#[tokio::test]
+async fn ws_eyes_override_emits_layered_state_update() {
     let base = spawn_server().await;
     let ws_url = base.replacen("http://", "ws://", 1) + "/ws";
     let (mut socket, _) = connect_async(&ws_url).await.unwrap();
@@ -292,6 +278,10 @@ async fn ws_eyes_override_via_protocol() {
         if msg["type"].as_str() == Some("StateUpdate")
             && msg["payload"]["eyes"].as_str() == Some("closed")
         {
+            assert_eq!(
+                msg["payload"]["eyes_frame"].as_str(),
+                Some("/frames/eyes/closed.png")
+            );
             saw_closed = true;
             break;
         }

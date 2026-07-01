@@ -1,5 +1,5 @@
 # Rusty-Tuber configuration. All tunables live here.
-# See README.md for the full asset layout and OBS setup.
+# See README.md for the layered asset layout and OBS setup.
 
 [audio]
 sample_rate = 44100      # Target sample rate (Hz). cpal negotiates; not guaranteed.
@@ -9,26 +9,33 @@ mode = "input"           # "input" (mic) | "loopback" (system output via a monit
 device = ""              # "" = system default. Else exact name from `rusty-tuber --list-audio-devices`.
 
 [thresholds]
-# RMS level that must be exceeded to open the mouth to each state.
-# Must satisfy slight < medium < open.
-slight = 0.02
+# RMS level that must be exceeded to open the mouth to each level.
+# Must satisfy partial < medium < open.
+partial = 0.02
 medium = 0.08
 open = 0.18
+# Optional: which mouth levels are active. Default = all four.
+# Disable a level to drop it; the next-lowest becomes the resting mouth — e.g.
+# test 3 positions with partial as the resting mouth:
+#   enabled = ["partial", "medium", "open"]
+# (This is also adjustable at runtime from the panel's "Mouth tuning" card.)
+enabled = ["closed", "partial", "medium", "open"]
 
 [engine]
-default_emotion = "calm"
+# Resting emotion (eye-expression set). Empty = the base/default eyes.
+# If set, it must name a folder under eyes/<name>/.
+default_emotion = ""
 asset_root = "./assets/characters/default_macaw"
-bind = "127.0.0.1:8080"  # OBS Browser Source should point at http://<bind>/
+bind = "127.0.0.1:8080"  # OBS Browser Source should point at http://<bind>/stage.html
 
-# Emotion auto-revert timers, in seconds.
+# Emotion auto-revert timers, in seconds. Keys name emotions (eye sets).
 # Omit an emotion here to make it stick until manually cleared.
+# Empty by default since the placeholder art ships no emotions.
 [timers]
-surprised = 2.5
-pleased = 3.0
-laughing = 1.5
 
 # Eye-blink scheduler. Optional — every key has a default, so you can omit the
-# whole section. Blink frames are <mouth>-blink.png per emotion folder.
+# whole section. Blink uses eyes/closed.png (falls back to eyes/open.png if
+# absent, i.e. no visible blink).
 [blink]
 enabled = true             # Set false to disable blinking entirely.
 min_interval = 2.5         # Seconds between blinks (randomised in [min, max]).

@@ -12,12 +12,13 @@
 
 use crate::assets::AssetCatalog;
 use crate::protocol::{
-    AvatarSnapshot, ClientMessage, EyeState, MouthState, ServerMessage,
+    AvatarSnapshot, ClientMessage, EyeState, MouthConfig, MouthState,
+    ServerMessage,
 };
 use crate::state::StateCommand;
 use axum::extract::ws::{Message, WebSocket};
 use axum::extract::{Path, State, WebSocketUpgrade};
-use axum::http::{header, StatusCode};
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -25,9 +26,18 @@ use futures_util::{SinkExt, StreamExt};
 use rust_embed::RustEmbed;
 use std::path::Path as FsPath;
 use std::sync::Arc;
-use tokio::sync::{broadcast, mpsc, RwLock};
+use tokio::sync::{broadcast, mpsc, RwLock, Semaphore};
 use tokio::task::JoinHandle;
+use tower_http::set_header::SetResponseHeaderLayer;
 use tracing::{debug, warn};
+
+/// Maximum inbound WebSocket message size (256 KiB). The protocol messages are
+/// a few dozen bytes, so this is generous while capping malicious/buggy clients.
+const MAX_WS_MESSAGE_SIZE: usize = 256 * 1024;
+/// Maximum inbound WebSocket frame size.
+const MAX_WS_FRAME_SIZE: usize = 256 * 1024;
+/// Concurrent WebSocket clients (panel, OBS source, phones, Stream Deck...).
+const MAX_WS_CLIENTS: usize = 16;
 
 #[derive(RustEmbed)]
 #[folder = "web/"]
@@ -40,29 +50,64 @@ pub struct AppState {
     pub cmd_tx: mpsc::UnboundedSender<StateCommand>,
     pub bcast_tx: broadcast::Sender<ServerMessage>,
     pub snapshot: Arc<RwLock<Option<AvatarSnapshot>>>,
+    /// Latest mouth-level configuration (enablement + thresholds), mirrored
+    /// from the state task for `GET /api/mouth-config` and the WS `Welcome`.
+    pub mouth_config: Arc<RwLock<MouthConfig>>,
+    /// Limits concurrent WebSocket clients to [`MAX_WS_CLIENTS`].
+    pub ws_permits: Arc<Semaphore>,
+}
+
+impl AppState {
+    /// Construct shared state with the default WebSocket concurrency cap.
+    pub fn new(
+        catalog: Arc<AssetCatalog>,
+        default_emotion: String,
+        cmd_tx: mpsc::UnboundedSender<StateCommand>,
+        bcast_tx: broadcast::Sender<ServerMessage>,
+        snapshot: Arc<RwLock<Option<AvatarSnapshot>>>,
+        mouth_config: Arc<RwLock<MouthConfig>>,
+    ) -> Self {
+        Self {
+            catalog,
+            default_emotion,
+            cmd_tx,
+            bcast_tx,
+            snapshot,
+            mouth_config,
+            ws_permits: Arc::new(Semaphore::new(MAX_WS_CLIENTS)),
+        }
+    }
 }
 
 /// Build the full HTTP/WS router.
 pub fn build_router(state: Arc<AppState>, asset_root: &FsPath) -> Router {
+    // Frames are immutable for the lifetime of the process (assets load once at
+    // startup), so let the browser reuse them without revalidating. This keeps
+    // the first mouth/blink swap after OBS reconnects flicker-free.
+    let frames = Router::new()
+        .fallback_service(tower_http::services::ServeDir::new(asset_root))
+        .layer(SetResponseHeaderLayer::overriding(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("public, max-age=3600"),
+        ));
+
     Router::new()
         .route("/", get(index))
         .route("/:file", get(embedded_file))
         .route("/ws", get(ws_handler))
-        .nest_service(
-            "/frames",
-            tower_http::services::ServeDir::new(asset_root),
-        )
+        .nest("/frames", frames)
         .nest("/api", api_router())
         .with_state(state)
-        .layer(tower_http::cors::CorsLayer::very_permissive())
         .layer(tower_http::trace::TraceLayer::new_for_http())
 }
 
 /// Spawn a task that mirrors the latest `StateUpdate` into the shared snapshot
-/// so `GET /api/state` stays current.
+/// so `GET /api/state` stays current, and `MouthConfigUpdate` into the shared
+/// mouth config so `GET /api/mouth-config` and new WS clients stay current.
 pub fn spawn_snapshot_recorder(state: Arc<AppState>) -> JoinHandle<()> {
     let mut rx = state.bcast_tx.subscribe();
     let snapshot = state.snapshot.clone();
+    let mouth_config = state.mouth_config.clone();
     tokio::spawn(async move {
         loop {
             match rx.recv().await {
@@ -72,7 +117,10 @@ pub fn spawn_snapshot_recorder(state: Arc<AppState>) -> JoinHandle<()> {
                     eyes,
                     volume,
                     overridden,
-                    frame,
+                    mouth_overridden,
+                    eyes_overridden,
+                    eyes_frame,
+                    mouth_frame,
                     default_emotion,
                 }) => {
                     *snapshot.write().await = Some(AvatarSnapshot {
@@ -81,9 +129,15 @@ pub fn spawn_snapshot_recorder(state: Arc<AppState>) -> JoinHandle<()> {
                         eyes,
                         volume,
                         overridden,
-                        frame,
+                        mouth_overridden,
+                        eyes_overridden,
+                        eyes_frame,
+                        mouth_frame,
                         default_emotion,
                     });
+                }
+                Ok(ServerMessage::MouthConfigUpdate { config }) => {
+                    *mouth_config.write().await = config;
                 }
                 Ok(_) => {}
                 Err(broadcast::error::RecvError::Lagged(n)) => {
@@ -135,8 +189,13 @@ fn serve_embedded(path: &str) -> Response {
 
 fn api_router() -> Router<Arc<AppState>> {
     Router::new()
+        .route("/health", get(api_health))
         .route("/catalog", get(api_catalog))
         .route("/state", get(api_state))
+        .route(
+            "/mouth-config",
+            get(api_get_mouth_config).post(api_set_mouth_config),
+        )
         .route("/emotion/:name", post(api_trigger_emotion))
         .route("/clear", post(api_clear))
         .route("/default/:name", post(api_set_default))
@@ -146,13 +205,37 @@ fn api_router() -> Router<Arc<AppState>> {
         .route("/eyes", post(api_clear_eyes))
 }
 
+async fn api_health() -> Response {
+    Json(serde_json::json!({ "status": "ok" })).into_response()
+}
+
+/// JSON error envelope used by every failing REST handler so clients can parse
+/// a consistent shape (`{"error": "..."}`) regardless of the status code.
+fn api_error(status: StatusCode, message: impl Into<String>) -> Response {
+    (
+        status,
+        [(header::CONTENT_TYPE, "application/json")],
+        Json(serde_json::json!({ "error": message.into() })),
+    )
+        .into_response()
+}
+
+/// Lower-case + validate an emotion name against the catalog, returning the
+/// canonical key on success or an error message on failure.
+fn resolve_emotion(
+    catalog: &AssetCatalog,
+    raw: &str,
+) -> Result<String, String> {
+    let key = raw.to_ascii_lowercase();
+    if catalog.has_emotion(&key) {
+        Ok(key)
+    } else {
+        Err(format!("unknown emotion: {raw}"))
+    }
+}
+
 async fn api_catalog(State(st): State<Arc<AppState>>) -> Response {
-    Json(serde_json::json!({
-        "default_emotion": default_or_snapshot(&st).await,
-        "emotions": st.catalog.emotions().collect::<Vec<_>>(),
-        "frames": st.catalog.catalog(),
-    }))
-    .into_response()
+    Json(st.catalog.catalog()).into_response()
 }
 
 async fn api_state(State(st): State<Arc<AppState>>) -> Response {
@@ -162,9 +245,18 @@ async fn api_state(State(st): State<Arc<AppState>>) -> Response {
         None => {
             // No audio yet: synthesise a resting snapshot.
             let default = default_or_snapshot(&st).await;
-            let frame = st
+            let emotion_opt = if default.is_empty() {
+                None
+            } else {
+                Some(default.as_str())
+            };
+            let eyes_frame = st
                 .catalog
-                .frame_url(&default, MouthState::Closed, EyeState::Open)
+                .eyes_frame(emotion_opt, EyeState::Open)
+                .unwrap_or_default();
+            let mouth_frame = st
+                .catalog
+                .mouth_frame(MouthState::Closed)
                 .unwrap_or_default();
             Json(AvatarSnapshot {
                 emotion: default,
@@ -172,7 +264,10 @@ async fn api_state(State(st): State<Arc<AppState>>) -> Response {
                 eyes: EyeState::Open,
                 volume: 0.0,
                 overridden: false,
-                frame,
+                mouth_overridden: false,
+                eyes_overridden: false,
+                eyes_frame,
+                mouth_frame,
                 default_emotion: st.default_emotion.clone(),
             })
             .into_response()
@@ -180,17 +275,32 @@ async fn api_state(State(st): State<Arc<AppState>>) -> Response {
     }
 }
 
+async fn api_get_mouth_config(State(st): State<Arc<AppState>>) -> Response {
+    Json(st.mouth_config.read().await.clone()).into_response()
+}
+
+async fn api_set_mouth_config(
+    State(st): State<Arc<AppState>>,
+    Json(config): Json<MouthConfig>,
+) -> Response {
+    if let Err(msg) = config.validate() {
+        return api_error(StatusCode::BAD_REQUEST, msg);
+    }
+    let _ = st.cmd_tx.send(StateCommand::SetMouthConfig(config));
+    StatusCode::NO_CONTENT.into_response()
+}
+
 async fn api_trigger_emotion(
     State(st): State<Arc<AppState>>,
     Path(name): Path<String>,
 ) -> Response {
-    let key = name.to_ascii_lowercase();
-    if st.catalog.get(&key).is_none() {
-        return (StatusCode::NOT_FOUND, format!("unknown emotion: {name}"))
-            .into_response();
+    match resolve_emotion(&st.catalog, &name) {
+        Ok(key) => {
+            let _ = st.cmd_tx.send(StateCommand::TriggerEmotion(key));
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Err(msg) => api_error(StatusCode::NOT_FOUND, msg),
     }
-    let _ = st.cmd_tx.send(StateCommand::TriggerEmotion(key));
-    StatusCode::NO_CONTENT.into_response()
 }
 
 async fn api_clear(State(st): State<Arc<AppState>>) -> Response {
@@ -202,13 +312,13 @@ async fn api_set_default(
     State(st): State<Arc<AppState>>,
     Path(name): Path<String>,
 ) -> Response {
-    let key = name.to_ascii_lowercase();
-    if st.catalog.get(&key).is_none() {
-        return (StatusCode::NOT_FOUND, format!("unknown emotion: {name}"))
-            .into_response();
+    match resolve_emotion(&st.catalog, &name) {
+        Ok(key) => {
+            let _ = st.cmd_tx.send(StateCommand::SetDefault(key));
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Err(msg) => api_error(StatusCode::NOT_FOUND, msg),
     }
-    let _ = st.cmd_tx.send(StateCommand::SetDefault(key));
-    StatusCode::NO_CONTENT.into_response()
 }
 
 async fn api_set_mouth(
@@ -220,13 +330,12 @@ async fn api_set_mouth(
             let _ = st.cmd_tx.send(StateCommand::SetMouthOverride(m));
             StatusCode::NO_CONTENT.into_response()
         }
-        None => (
+        None => api_error(
             StatusCode::BAD_REQUEST,
             format!(
-                "invalid mouth: {mouth} (expected closed|slight|medium|open)"
+                "invalid mouth: {mouth} (expected closed|partial|medium|open)"
             ),
-        )
-            .into_response(),
+        ),
     }
 }
 
@@ -244,11 +353,10 @@ async fn api_set_eyes(
             let _ = st.cmd_tx.send(StateCommand::SetEyesOverride(e));
             StatusCode::NO_CONTENT.into_response()
         }
-        None => (
+        None => api_error(
             StatusCode::BAD_REQUEST,
             format!("invalid eyes: {state} (expected open|closed)"),
-        )
-            .into_response(),
+        ),
     }
 }
 
@@ -264,8 +372,72 @@ async fn api_clear_eyes(State(st): State<Arc<AppState>>) -> Response {
 async fn ws_handler(
     ws: WebSocketUpgrade,
     State(st): State<Arc<AppState>>,
+    headers: HeaderMap,
 ) -> Response {
-    ws.on_upgrade(move |socket| handle_ws(socket, st))
+    // Origin guard: non-browser clients (OBS, curl, Stream Deck) send no
+    // `Origin` header and are allowed; browser origins are allowed only when
+    // they resolve to a loopback or private-LAN host, so a random website can't
+    // open the live control channel and drive the avatar.
+    if let Some(origin) = headers
+        .get(header::ORIGIN)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned)
+    {
+        if !origin_local(&origin) {
+            return api_error(
+                StatusCode::FORBIDDEN,
+                format!("origin not allowed: {origin}"),
+            );
+        }
+    }
+
+    // Bound concurrent clients so a runaway/abusive source can't exhaust FDs.
+    let permit = match st.ws_permits.clone().try_acquire_owned() {
+        Ok(p) => p,
+        Err(_) => {
+            return api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "too many websocket clients",
+            )
+        }
+    };
+
+    ws.max_message_size(MAX_WS_MESSAGE_SIZE)
+        .max_frame_size(MAX_WS_FRAME_SIZE)
+        .on_upgrade(move |socket| async move {
+            let _permit = permit; // held until the socket task ends
+            handle_ws(socket, st).await;
+        })
+}
+
+/// True if the host portion of an `Origin` URL is loopback or a private LAN
+/// address (the panel/OBS/phone use cases). `Origin` is absent for non-browser
+/// clients and is checked separately at the call site.
+fn origin_local(origin: &str) -> bool {
+    let after_scheme = origin.split("://").nth(1).unwrap_or(origin);
+    let authority = after_scheme.split('/').next().unwrap_or(after_scheme);
+    let host = authority
+        .rsplit_once(':')
+        .map(|(h, _)| h)
+        .unwrap_or(authority);
+    is_local_host(host)
+}
+
+fn is_local_host(host: &str) -> bool {
+    match host {
+        "localhost" | "127.0.0.1" | "::1" | "[::1]" => true,
+        _ => {
+            let mut octets = host.split('.');
+            match (octets.next(), octets.next(), octets.next(), octets.next()) {
+                (Some("10"), _, _, _) => true,
+                (Some("172"), Some(b), _, _) => {
+                    b.parse::<u32>().is_ok_and(|n| (16..=31).contains(&n))
+                }
+                (Some("192"), Some("168"), _, _) => true,
+                _ => false,
+            }
+        }
+    }
 }
 
 async fn handle_ws(socket: WebSocket, st: Arc<AppState>) {
@@ -275,6 +447,7 @@ async fn handle_ws(socket: WebSocket, st: Arc<AppState>) {
     let welcome = ServerMessage::Welcome {
         catalog: st.catalog.catalog().clone(),
         default_emotion: default_or_snapshot(&st).await,
+        mouth_config: st.mouth_config.read().await.clone(),
     };
     if send_server_message(&mut sink, &welcome).await.is_err() {
         return;
@@ -304,7 +477,13 @@ async fn handle_ws(socket: WebSocket, st: Arc<AppState>) {
                         }
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
-                        warn!(lag = n, "ws client lagged; will resync on next update");
+                        warn!(lag = n, "ws client lagged; resyncing from snapshot");
+                        if resync_from_snapshot(&st, &mut sink)
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
                     }
                     Err(broadcast::error::RecvError::Closed) => break,
                 }
@@ -312,6 +491,31 @@ async fn handle_ws(socket: WebSocket, st: Arc<AppState>) {
         }
     }
     debug!("websocket client disconnected");
+}
+
+/// Push the latest snapshot as a `StateUpdate` so a lagging client re-syncs
+/// immediately instead of freezing on a stale frame.
+async fn resync_from_snapshot(
+    st: &AppState,
+    sink: &mut futures_util::stream::SplitSink<WebSocket, Message>,
+) -> Result<(), axum::Error> {
+    if let Some(s) = st.snapshot.read().await.clone() {
+        let msg = ServerMessage::StateUpdate {
+            emotion: s.emotion,
+            mouth: s.mouth,
+            eyes: s.eyes,
+            volume: s.volume,
+            overridden: s.overridden,
+            mouth_overridden: s.mouth_overridden,
+            eyes_overridden: s.eyes_overridden,
+            eyes_frame: s.eyes_frame,
+            mouth_frame: s.mouth_frame,
+            default_emotion: s.default_emotion,
+        };
+        send_server_message(sink, &msg).await
+    } else {
+        Ok(())
+    }
 }
 
 async fn handle_client_text(
@@ -322,19 +526,19 @@ async fn handle_client_text(
     let parsed: Result<ClientMessage, _> = serde_json::from_str(text);
     match parsed {
         Ok(ClientMessage::TriggerEmotion { emotion }) => {
-            let key = emotion.to_ascii_lowercase();
-            if st.catalog.get(&key).is_none() {
-                reply_error(sink, &format!("unknown emotion: {emotion}")).await;
-            } else {
-                let _ = st.cmd_tx.send(StateCommand::TriggerEmotion(key));
+            match resolve_emotion(&st.catalog, &emotion) {
+                Ok(key) => {
+                    let _ = st.cmd_tx.send(StateCommand::TriggerEmotion(key));
+                }
+                Err(msg) => reply_error(sink, &msg).await,
             }
         }
         Ok(ClientMessage::SetDefault { emotion }) => {
-            let key = emotion.to_ascii_lowercase();
-            if st.catalog.get(&key).is_none() {
-                reply_error(sink, &format!("unknown emotion: {emotion}")).await;
-            } else {
-                let _ = st.cmd_tx.send(StateCommand::SetDefault(key));
+            match resolve_emotion(&st.catalog, &emotion) {
+                Ok(key) => {
+                    let _ = st.cmd_tx.send(StateCommand::SetDefault(key));
+                }
+                Err(msg) => reply_error(sink, &msg).await,
             }
         }
         Ok(ClientMessage::ClearOverride) => {
@@ -345,6 +549,13 @@ async fn handle_client_text(
         }
         Ok(ClientMessage::ClearMouthOverride) => {
             let _ = st.cmd_tx.send(StateCommand::ClearMouthOverride);
+        }
+        Ok(ClientMessage::SetMouthConfig { config }) => {
+            if let Err(msg) = config.validate() {
+                reply_error(sink, &msg).await;
+            } else {
+                let _ = st.cmd_tx.send(StateCommand::SetMouthConfig(config));
+            }
         }
         Ok(ClientMessage::SetEyesOverride { eyes }) => {
             let _ = st.cmd_tx.send(StateCommand::SetEyesOverride(eyes));

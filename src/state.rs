@@ -10,10 +10,14 @@
 //! State changes are broadcast to all subscribers (the WebSocket layer) on a
 //! `tokio::sync::broadcast` channel. Volume-only drift is throttled to ~20 Hz
 //! so the web-app meter stays lively without flooding slow clients.
+//!
+//! In the layered art model the avatar is a static body plus independent eye
+//! and mouth layers. This task resolves the current eye/mouth layer URLs from
+//! the catalog and sends them in every `StateUpdate`; the body never changes.
 
 use crate::assets::AssetCatalog;
-use crate::config::{BlinkSettings, ThresholdSettings};
-use crate::protocol::{EyeState, MouthState, ServerMessage};
+use crate::config::BlinkSettings;
+use crate::protocol::{EyeState, MouthConfig, MouthState, ServerMessage};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use std::collections::HashMap;
@@ -31,8 +35,8 @@ const VOLUME_BROADCAST_INTERVAL: Duration = Duration::from_millis(50);
 pub enum StateCommand {
     /// Smoothed RMS volume in roughly `[0.0, 1.0]`, from the audio analyser.
     SetVolume(f32),
-    /// Client requested an emotion. The caller (net layer) must have validated
-    /// that the emotion exists in the catalog.
+    /// Client requested an emotion (eye-expression set). The caller (net layer)
+    /// must have validated that the emotion exists in the catalog.
     TriggerEmotion(String),
     /// Client dropped the emotion override (manual clear).
     ClearOverride,
@@ -42,6 +46,8 @@ pub enum StateCommand {
     SetMouthOverride(MouthState),
     /// Client released a forced mouth shape.
     ClearMouthOverride,
+    /// Client updated the mouth-level configuration (enabled + thresholds).
+    SetMouthConfig(MouthConfig),
     /// Internal: the blink scheduler closed the eyes.
     BlinkClose,
     /// Internal: the blink scheduler opened the eyes.
@@ -58,17 +64,39 @@ pub enum StateCommand {
     Shutdown,
 }
 
-/// Map smoothed RMS volume to a mouth level using the configured thresholds.
-pub fn volume_to_mouth(v: f32, t: &ThresholdSettings) -> MouthState {
-    if v >= t.open {
-        MouthState::Open
-    } else if v >= t.medium {
-        MouthState::Medium
-    } else if v >= t.slight {
-        MouthState::Slight
-    } else {
-        MouthState::Closed
+/// Map smoothed RMS volume to a mouth level using the active configuration.
+///
+/// The lowest enabled level is the resting mouth (returned at low volume); each
+/// higher enabled level engages when volume reaches its threshold. Disabled
+/// levels are skipped entirely, so turning off `closed` makes `partial` the
+/// resting mouth (3-position mode).
+pub fn volume_to_mouth(v: f32, cfg: &MouthConfig) -> MouthState {
+    const ASCENDING: [MouthState; 4] = [
+        MouthState::Closed,
+        MouthState::Partial,
+        MouthState::Medium,
+        MouthState::Open,
+    ];
+    let resting = ASCENDING
+        .iter()
+        .find(|l| cfg.is_enabled(**l))
+        .copied()
+        .unwrap_or(MouthState::Closed);
+    // Highest enabled level (above resting) whose threshold <= v.
+    for &l in ASCENDING.iter().rev() {
+        if l.level() <= resting.level() {
+            break;
+        }
+        if !cfg.is_enabled(l) {
+            continue;
+        }
+        if let Some(th) = cfg.threshold(l) {
+            if v >= th {
+                return l;
+            }
+        }
     }
+    resting
 }
 
 /// Spawn the state task. Returns its `JoinHandle`. The caller retains the
@@ -76,7 +104,7 @@ pub fn volume_to_mouth(v: f32, t: &ThresholdSettings) -> MouthState {
 #[allow(clippy::too_many_arguments)]
 pub fn spawn(
     catalog: Arc<AssetCatalog>,
-    thresholds: ThresholdSettings,
+    mouth_config: MouthConfig,
     timers: HashMap<String, f32>,
     default_emotion: String,
     cmd_tx: mpsc::UnboundedSender<StateCommand>,
@@ -85,7 +113,7 @@ pub fn spawn(
 ) -> JoinHandle<()> {
     let mut machine = StateMachine {
         catalog,
-        thresholds,
+        mouth_config,
         timers,
         default_emotion: default_emotion.clone(),
         emotion_override: None,
@@ -117,7 +145,7 @@ pub fn spawn(
 
 struct StateMachine {
     catalog: Arc<AssetCatalog>,
-    thresholds: ThresholdSettings,
+    mouth_config: MouthConfig,
     timers: HashMap<String, f32>,
     default_emotion: String,
     emotion_override: Option<String>,
@@ -145,6 +173,17 @@ impl StateMachine {
             .unwrap_or(&self.default_emotion)
     }
 
+    /// The emotion name to look up in the catalog for the eye layer, or `None`
+    /// when no emotion is active (resting on the default/base eyes).
+    fn emotion_for_eyes(&self) -> Option<&str> {
+        let e = self.effective_emotion();
+        if e.is_empty() {
+            None
+        } else {
+            Some(e)
+        }
+    }
+
     fn effective_mouth(&self) -> MouthState {
         self.mouth_override.unwrap_or(self.mouth)
     }
@@ -153,14 +192,10 @@ impl StateMachine {
         self.eyes_override.unwrap_or(self.eyes)
     }
 
-    /// The currently-displayed frame URL (for change detection).
-    fn current_frame(&self) -> String {
+    /// The currently-displayed eye layer URL (for change detection).
+    fn current_eyes_frame(&self) -> String {
         self.catalog
-            .frame_url(
-                self.effective_emotion(),
-                self.effective_mouth(),
-                self.effective_eyes(),
-            )
+            .eyes_frame(self.emotion_for_eyes(), self.effective_eyes())
             .unwrap_or_default()
     }
 
@@ -168,7 +203,7 @@ impl StateMachine {
         match cmd {
             StateCommand::SetVolume(v) => {
                 self.volume = v.clamp(0.0, 1.0);
-                self.mouth = volume_to_mouth(self.volume, &self.thresholds);
+                self.mouth = volume_to_mouth(self.volume, &self.mouth_config);
                 // High-frequency path: dedupe identical visible state and
                 // throttle volume-only drift to keep the meter fresh.
                 let now = Instant::now();
@@ -228,24 +263,35 @@ impl StateMachine {
                 self.mouth_override = None;
                 self.broadcast_now();
             }
+            StateCommand::SetMouthConfig(config) => {
+                // A change to enablement can move the resting mouth (e.g.
+                // disabling `closed` makes `partial` the resting level), so
+                // recompute the mic-driven mouth and broadcast state too.
+                self.mouth_config = config.clone();
+                self.mouth = volume_to_mouth(self.volume, &self.mouth_config);
+                let _ = self
+                    .bcast
+                    .send(ServerMessage::MouthConfigUpdate { config });
+                self.broadcast_now();
+            }
             StateCommand::BlinkClose => {
                 // A manual eyes override pauses the scheduler entirely.
                 if self.eyes_override.is_none() {
-                    let before = self.current_frame();
+                    let before = self.current_eyes_frame();
                     self.eyes = EyeState::Closed;
-                    // Only broadcast when the visible frame actually changes
-                    // (e.g. an emotion with no blink art resolves to the same
-                    // eyes-open frame, so nothing is sent).
-                    if self.current_frame() != before {
+                    // Only broadcast when the visible eye layer actually changes
+                    // (e.g. an emotion with no `closed.png` resolves to the same
+                    // `open` frame, so nothing is sent).
+                    if self.current_eyes_frame() != before {
                         self.broadcast_now();
                     }
                 }
             }
             StateCommand::BlinkOpen => {
                 if self.eyes_override.is_none() {
-                    let before = self.current_frame();
+                    let before = self.current_eyes_frame();
                     self.eyes = EyeState::Open;
-                    if self.current_frame() != before {
+                    if self.current_eyes_frame() != before {
                         self.broadcast_now();
                     }
                 }
@@ -277,20 +323,33 @@ impl StateMachine {
         eyes: EyeState,
         now: Instant,
     ) {
-        let frame = self
+        let eyes_frame = self
             .catalog
-            .frame_url(emotion, mouth, eyes)
+            .eyes_frame(
+                if emotion.is_empty() {
+                    None
+                } else {
+                    Some(emotion)
+                },
+                eyes,
+            )
             .unwrap_or_default();
-        let overridden = self.emotion_override.is_some()
-            || self.mouth_override.is_some()
-            || self.eyes_override.is_some();
+        let mouth_frame = self.catalog.mouth_frame(mouth).unwrap_or_default();
+        let emotion_overridden = self.emotion_override.is_some();
+        let mouth_overridden = self.mouth_override.is_some();
+        let eyes_overridden = self.eyes_override.is_some();
+        let overridden =
+            emotion_overridden || mouth_overridden || eyes_overridden;
         let msg = ServerMessage::StateUpdate {
             emotion: emotion.to_string(),
             mouth,
             eyes,
             volume: self.volume,
             overridden,
-            frame,
+            mouth_overridden,
+            eyes_overridden,
+            eyes_frame,
+            mouth_frame,
             default_emotion: self.default_emotion.clone(),
         };
         // `send` errors only when there are no receivers; that's fine.
@@ -346,84 +405,47 @@ pub fn spawn_blink_scheduler(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::assets::AssetCatalog;
-    use crate::protocol::{FrameGrid, MouthSet};
+    use crate::protocol::{EyeLayers, LayerCatalog, MouthLayers};
     use std::collections::BTreeMap;
 
-    fn mouth(
-        closed: &str,
-        slight: Option<&str>,
-        medium: Option<&str>,
-        open: &str,
-    ) -> MouthSet {
-        MouthSet {
-            closed: Some(closed.into()),
-            slight: slight.map(Into::into),
-            medium: medium.map(Into::into),
-            open: Some(open.into()),
-        }
-    }
-
     fn fake_catalog() -> AssetCatalog {
-        let mut m = BTreeMap::new();
-        // calm: full eyes-open + full blink set
-        m.insert(
-            "calm".into(),
-            FrameGrid {
-                eyes_open: mouth(
-                    "calm/closed.png",
-                    Some("calm/slight.png"),
-                    Some("calm/medium.png"),
-                    "calm/open.png",
-                ),
-                eyes_closed: Some(mouth(
-                    "calm/closed-blink.png",
-                    Some("calm/slight-blink.png"),
-                    Some("calm/medium-blink.png"),
-                    "calm/open-blink.png",
-                )),
+        AssetCatalog(LayerCatalog {
+            base: vec!["base/body.png".into()],
+            mouths: MouthLayers {
+                closed: Some("mouths/closed.png".into()),
+                partial: Some("mouths/partial.png".into()),
+                medium: Some("mouths/medium.png".into()),
+                open: Some("mouths/open.png".into()),
             },
-        );
-        // surprised: only closed/open eyes-open, no blink art
-        m.insert(
-            "surprised".into(),
-            FrameGrid {
-                eyes_open: mouth(
-                    "surprised/closed.png",
-                    None,
-                    None,
-                    "surprised/open.png",
-                ),
-                eyes_closed: None,
+            default_eyes: EyeLayers {
+                open: Some("eyes/open.png".into()),
+                closed: Some("eyes/closed.png".into()),
             },
-        );
-        // angry: closed/open eyes-open, partial blink (closed+open only)
-        m.insert(
-            "angry".into(),
-            FrameGrid {
-                eyes_open: mouth(
-                    "angry/closed.png",
-                    None,
-                    None,
-                    "angry/open.png",
-                ),
-                eyes_closed: Some(mouth(
-                    "angry/closed-blink.png",
-                    None,
-                    None,
-                    "angry/open-blink.png",
-                )),
+            emotions: {
+                let mut m = BTreeMap::new();
+                // surprised: eyes only (open + closed blink)
+                m.insert(
+                    "surprised".into(),
+                    EyeLayers {
+                        open: Some("eyes/surprised/open.png".into()),
+                        closed: Some("eyes/surprised/closed.png".into()),
+                    },
+                );
+                // flat: open only (no blink)
+                m.insert(
+                    "flat".into(),
+                    EyeLayers {
+                        open: Some("eyes/flat/open.png".into()),
+                        closed: None,
+                    },
+                );
+                m
             },
-        );
-        AssetCatalog(m)
+        })
     }
 
-    fn thresholds() -> ThresholdSettings {
-        ThresholdSettings {
-            slight: 0.02,
-            medium: 0.08,
-            open: 0.18,
-        }
+    fn mouth_config() -> MouthConfig {
+        MouthConfig::all_enabled(0.02, 0.08, 0.18)
     }
 
     async fn harness() -> (
@@ -438,9 +460,9 @@ mod tests {
         let (bcast_tx, bcast_rx) = broadcast::channel(64);
         let handle = spawn(
             catalog,
-            thresholds(),
+            mouth_config(),
             timers,
-            "calm".into(),
+            String::new(), // no resting emotion -> default eyes
             cmd_tx.clone(),
             cmd_rx,
             bcast_tx,
@@ -454,8 +476,8 @@ mod tests {
         mouth: MouthState,
         eyes: EyeState,
         volume: f32,
-        frame: String,
-        default_emotion: String,
+        eyes_frame: String,
+        mouth_frame: String,
     }
 
     fn unwrap_state(msg: ServerMessage) -> S {
@@ -466,82 +488,105 @@ mod tests {
                 eyes,
                 volume,
                 overridden: _,
-                frame,
-                default_emotion,
+                mouth_overridden: _,
+                eyes_overridden: _,
+                eyes_frame,
+                mouth_frame,
+                default_emotion: _,
             } => S {
                 emotion,
                 mouth,
                 eyes,
                 volume,
-                frame,
-                default_emotion,
+                eyes_frame,
+                mouth_frame,
             },
             other => panic!("expected StateUpdate, got {other:?}"),
         }
     }
 
     #[tokio::test]
-    async fn volume_maps_to_mouth_and_broadcasts() {
+    async fn volume_maps_to_mouth_and_broadcasts_layers() {
         let (tx, mut rx, _h) = harness().await;
         tx.send(StateCommand::SetVolume(0.5)).unwrap(); // above open(0.18) -> Open
         let s = unwrap_state(rx.recv().await.unwrap());
-        assert_eq!(s.emotion, "calm");
         assert_eq!(s.mouth, MouthState::Open);
         assert_eq!(s.eyes, EyeState::Open);
-        assert!((s.volume - 0.5).abs() < 1e-9);
-        assert_eq!(s.frame, "/frames/calm/open.png");
-        assert_eq!(s.default_emotion, "calm");
+        // Resting state uses default eyes + the resolved mouth layer.
+        assert_eq!(s.eyes_frame, "/frames/eyes/open.png");
+        assert_eq!(s.mouth_frame, "/frames/mouths/open.png");
     }
 
     #[tokio::test]
-    async fn emotion_override_and_timer_revert() {
+    async fn disabling_closed_makes_partial_the_resting_mouth() {
+        // 3-position mode: closed off → partial is resting, medium/open engage
+        // at their thresholds. Validates the A/B-test + optimization path.
+        let cfg = MouthConfig {
+            enabled: [false, true, true, true],
+            partial: 0.02,
+            medium: 0.08,
+            open: 0.18,
+        };
+        // silence → partial (resting), never closed
+        assert_eq!(volume_to_mouth(0.0, &cfg), MouthState::Partial);
+        assert_eq!(volume_to_mouth(0.01, &cfg), MouthState::Partial);
+        // crosses medium
+        assert_eq!(volume_to_mouth(0.09, &cfg), MouthState::Medium);
+        // crosses open
+        assert_eq!(volume_to_mouth(0.5, &cfg), MouthState::Open);
+    }
+
+    #[tokio::test]
+    async fn emotion_swaps_eye_layer_and_timer_reverts() {
         let (tx, mut rx, _h) = harness().await;
         tx.send(StateCommand::TriggerEmotion("surprised".into()))
             .unwrap();
         let s = unwrap_state(rx.recv().await.unwrap());
         assert_eq!(s.emotion, "surprised");
+        assert_eq!(s.eyes_frame, "/frames/eyes/surprised/open.png");
+        // Mouth layer is shared across emotions.
+        assert_eq!(s.mouth_frame, "/frames/mouths/closed.png");
 
-        // timer is 0.1s; should revert to calm.
+        // timer is 0.1s; should revert to default eyes.
         tokio::time::sleep(Duration::from_millis(250)).await;
-        let mut last = String::new();
+        let mut eyes_frame = s.eyes_frame.clone();
         while let Ok(m) = rx.try_recv() {
-            last = unwrap_state(m).emotion;
+            eyes_frame = unwrap_state(m).eyes_frame;
         }
-        assert_eq!(last, "calm", "should have reverted to calm");
+        assert_eq!(eyes_frame, "/frames/eyes/open.png");
     }
 
     #[tokio::test]
     async fn stale_timer_does_not_clobber_newer_emotion() {
         let (tx, mut rx, _h) = harness().await;
-        // surprised has a 0.1s timer; calm has none.
         tx.send(StateCommand::TriggerEmotion("surprised".into()))
             .unwrap();
         let _ = rx.recv().await.unwrap();
-        tx.send(StateCommand::TriggerEmotion("calm".into()))
+        tx.send(StateCommand::TriggerEmotion("flat".into()))
             .unwrap();
         let s = unwrap_state(rx.recv().await.unwrap());
-        assert_eq!(s.emotion, "calm");
+        assert_eq!(s.emotion, "flat");
 
         tokio::time::sleep(Duration::from_millis(250)).await;
-        let mut still = String::from("calm");
+        let mut still = "flat".to_string();
         while let Ok(m) = rx.try_recv() {
             still = unwrap_state(m).emotion;
         }
-        assert_eq!(still, "calm", "newer emotion must remain in effect");
+        assert_eq!(still, "flat", "newer emotion must remain in effect");
     }
 
     #[tokio::test]
     async fn manual_clear_override_returns_to_default() {
         let (tx, mut rx, _h) = harness().await;
-        tx.send(StateCommand::TriggerEmotion("calm".into()))
+        tx.send(StateCommand::TriggerEmotion("surprised".into()))
             .unwrap();
         let _ = rx.recv().await.unwrap();
-        tx.send(StateCommand::SetDefault("surprised".into()))
-            .unwrap();
+        tx.send(StateCommand::SetDefault("flat".into())).unwrap();
         let _ = rx.recv().await.unwrap();
         tx.send(StateCommand::ClearOverride).unwrap();
         let s = unwrap_state(rx.recv().await.unwrap());
-        assert_eq!(s.emotion, "surprised");
+        assert_eq!(s.emotion, "flat");
+        assert_eq!(s.eyes_frame, "/frames/eyes/flat/open.png");
     }
 
     #[tokio::test]
@@ -555,6 +600,7 @@ mod tests {
             .unwrap();
         let s = unwrap_state(rx.recv().await.unwrap());
         assert_eq!(s.mouth, MouthState::Closed);
+        assert_eq!(s.mouth_frame, "/frames/mouths/closed.png");
 
         tokio::time::sleep(
             VOLUME_BROADCAST_INTERVAL + Duration::from_millis(20),
@@ -567,35 +613,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn blink_swaps_to_closed_eye_frame() {
+    async fn blink_swaps_eye_layer_to_closed() {
         let (tx, mut rx, _h) = harness().await;
-        // Establish eyes-open baseline on calm.
         tx.send(StateCommand::SetVolume(0.5)).unwrap(); // mouth Open
         let _ = unwrap_state(rx.recv().await.unwrap());
 
         tx.send(StateCommand::BlinkClose).unwrap();
         let s = unwrap_state(rx.recv().await.unwrap());
         assert_eq!(s.eyes, EyeState::Closed);
-        assert_eq!(s.frame, "/frames/calm/open-blink.png");
+        assert_eq!(s.eyes_frame, "/frames/eyes/closed.png");
 
         tx.send(StateCommand::BlinkOpen).unwrap();
         let s = unwrap_state(rx.recv().await.unwrap());
         assert_eq!(s.eyes, EyeState::Open);
-        assert_eq!(s.frame, "/frames/calm/open.png");
+        assert_eq!(s.eyes_frame, "/frames/eyes/open.png");
     }
 
     #[tokio::test]
-    async fn blink_falls_back_to_eyes_open_without_blink_art() {
+    async fn emotion_without_blink_art_does_not_change_frame() {
         let (tx, mut rx, _h) = harness().await;
-        tx.send(StateCommand::TriggerEmotion("surprised".into()))
+        // "flat" has only open.png; a blink must not change the visible frame.
+        tx.send(StateCommand::TriggerEmotion("flat".into()))
             .unwrap();
         let _ = unwrap_state(rx.recv().await.unwrap());
-        tx.send(StateCommand::SetVolume(0.5)).unwrap(); // mouth Open on surprised
-        let _ = unwrap_state(rx.recv().await.unwrap());
-
-        // surprised has no blink art: BlinkClose must NOT change the frame.
         tx.send(StateCommand::BlinkClose).unwrap();
-        // No broadcast is expected (effective eyes unchanged) — nothing to read.
+        // No broadcast expected (eye frame unchanged) — nothing to read.
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(
             rx.try_recv().is_err(),
@@ -604,26 +646,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn blink_snaps_mouth_within_eyes_closed() {
-        let (tx, mut rx, _h) = harness().await;
-        // angry has blink art only for closed+open. Medium snaps to open-blink.
-        tx.send(StateCommand::TriggerEmotion("angry".into()))
-            .unwrap();
-        let _ = unwrap_state(rx.recv().await.unwrap());
-        tx.send(StateCommand::SetVolume(0.1)).unwrap(); // mouth Medium (>=0.08,<0.18)
-        let _ = unwrap_state(rx.recv().await.unwrap());
-        tx.send(StateCommand::BlinkClose).unwrap();
-        let s = unwrap_state(rx.recv().await.unwrap());
-        assert_eq!(s.frame, "/frames/angry/open-blink.png");
-    }
-
-    #[tokio::test]
     async fn eyes_override_masks_blink() {
         let (tx, mut rx, _h) = harness().await;
         tx.send(StateCommand::SetVolume(0.5)).unwrap();
         let _ = unwrap_state(rx.recv().await.unwrap());
 
-        // Force eyes open: a subsequent BlinkClose must not change them.
         tx.send(StateCommand::SetEyesOverride(EyeState::Open))
             .unwrap();
         let _ = unwrap_state(rx.recv().await.unwrap());
@@ -631,15 +658,59 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(rx.try_recv().is_err(), "override must mask the blink");
 
-        // Force eyes closed and clear: blinking resumes.
         tx.send(StateCommand::SetEyesOverride(EyeState::Closed))
             .unwrap();
         let s = unwrap_state(rx.recv().await.unwrap());
         assert_eq!(s.eyes, EyeState::Closed);
         tx.send(StateCommand::ClearEyesOverride).unwrap();
         let s = unwrap_state(rx.recv().await.unwrap());
-        // After clearing, effective eyes == self.eyes which was last set Open by BlinkOpen? No
-        // BlinkOpen never fired; self.eyes is still Open from init. So effective -> Open.
         assert_eq!(s.eyes, EyeState::Open);
+    }
+
+    #[tokio::test]
+    async fn override_flags_are_broadcast_per_channel() {
+        let (tx, mut rx, _h) = harness().await;
+
+        tx.send(StateCommand::SetVolume(0.5)).unwrap();
+        let (emotion_ovr, mouth_ovr, eyes_ovr) =
+            unwrap_override_flags(&rx.recv().await.unwrap());
+        assert!(!emotion_ovr && !mouth_ovr && !eyes_ovr);
+
+        tx.send(StateCommand::SetMouthOverride(MouthState::Open))
+            .unwrap();
+        let (_, mouth_ovr, eyes_ovr) =
+            unwrap_override_flags(&rx.recv().await.unwrap());
+        assert!(mouth_ovr);
+        assert!(!eyes_ovr);
+
+        tx.send(StateCommand::TriggerEmotion("surprised".into()))
+            .unwrap();
+        let (emotion_ovr, mouth_ovr, _) =
+            unwrap_override_flags(&rx.recv().await.unwrap());
+        assert!(emotion_ovr);
+        assert!(mouth_ovr);
+
+        tx.send(StateCommand::SetEyesOverride(EyeState::Closed))
+            .unwrap();
+        let (_, _, eyes_ovr) = unwrap_override_flags(&rx.recv().await.unwrap());
+        assert!(eyes_ovr);
+
+        tx.send(StateCommand::ClearMouthOverride).unwrap();
+        let (_, mouth_ovr, eyes_ovr) =
+            unwrap_override_flags(&rx.recv().await.unwrap());
+        assert!(!mouth_ovr);
+        assert!(eyes_ovr);
+    }
+
+    fn unwrap_override_flags(msg: &ServerMessage) -> (bool, bool, bool) {
+        match msg {
+            ServerMessage::StateUpdate {
+                overridden,
+                mouth_overridden,
+                eyes_overridden,
+                ..
+            } => (*overridden, *mouth_overridden, *eyes_overridden),
+            other => panic!("expected StateUpdate, got {other:?}"),
+        }
     }
 }

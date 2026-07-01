@@ -3,6 +3,7 @@
 //! The raw structs mirror the TOML schema; [`AppConfig::validate`] enforces
 //! invariants (threshold ordering, non-empty default emotion, sensible bounds).
 
+use crate::protocol::{MouthConfig, MouthState};
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -50,15 +51,53 @@ fn default_smoothing() -> f32 {
     0.35
 }
 
-#[derive(Debug, Clone, Copy, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct ThresholdSettings {
-    pub slight: f32,
+    pub partial: f32,
     pub medium: f32,
     pub open: f32,
+    /// Optional: which mouth levels are active, by name. Defaults to all four
+    /// (`["closed", "partial", "medium", "open"]`). Disable a level (e.g.
+    /// `["partial", "medium", "open"]` to drop `closed`) to make the next-lowest
+    /// the resting mouth — handy for A/B-testing 3 vs 4 mouth positions.
+    #[serde(default)]
+    pub enabled: Vec<String>,
+}
+
+impl ThresholdSettings {
+    /// Build the runtime [`MouthConfig`], validating enablement + ordering.
+    pub fn to_mouth_config(&self) -> Result<MouthConfig> {
+        let mut enabled = [true; 4];
+        if !self.enabled.is_empty() {
+            enabled = [false; 4];
+            for name in &self.enabled {
+                let lvl = MouthState::from_str_ci(name).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "unknown mouth level in [thresholds].enabled: {name:?} \
+                         (expected closed|partial|medium|open)"
+                    )
+                })?;
+                enabled[lvl.level() as usize] = true;
+            }
+        }
+        let cfg = MouthConfig {
+            enabled,
+            partial: self.partial,
+            medium: self.medium,
+            open: self.open,
+        };
+        cfg.validate()
+            .map_err(|e| anyhow::anyhow!("[thresholds] {e}"))?;
+        Ok(cfg)
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct EngineSettings {
+    /// Resting emotion (eye-expression set). Empty = base/default eyes. If it
+    /// names an emotion not present in the catalog, the loader falls back to the
+    /// default eyes and logs a warning.
+    #[serde(default)]
     pub default_emotion: String,
     pub asset_root: PathBuf,
     pub bind: String,
@@ -129,23 +168,20 @@ impl AppConfig {
     /// Enforce structural invariants. Does not check that the asset catalog
     /// exists on disk (that happens later, non-fatally).
     pub fn validate(&self) -> Result<()> {
-        if self.engine.default_emotion.trim().is_empty() {
-            bail!("[engine].default_emotion must not be empty");
-        }
         if self.engine.bind.trim().is_empty() {
             bail!("[engine].bind must not be empty");
         }
 
         let t = &self.thresholds;
-        if !(t.slight < t.medium && t.medium < t.open) {
+        if !(t.partial < t.medium && t.medium < t.open) {
             bail!(
-                "[thresholds] must satisfy slight < medium < open (got slight={}, medium={}, open={})",
-                t.slight,
+                "[thresholds] must satisfy partial < medium < open (got partial={}, medium={}, open={})",
+                t.partial,
                 t.medium,
                 t.open
             );
         }
-        for v in [t.slight, t.medium, t.open] {
+        for v in [t.partial, t.medium, t.open] {
             if !v.is_finite() || v < 0.0 {
                 bail!(
                     "[thresholds] values must be non-negative finite numbers"
@@ -206,8 +242,8 @@ mod tests {
 sample_rate = 44100
 buffer_size = 1024
 
-[thresholds]
-slight = 0.02
+  [thresholds]
+partial = 0.02
 medium = 0.08
 open = 0.18
 
@@ -231,7 +267,7 @@ bind = "127.0.0.1:8080"
         let raw = MINIMAL.replacen("open = 0.18", "open = 0.05", 1);
         let err = AppConfig::from_toml_str(&raw).unwrap_err();
         let msg = format!("{err:#}");
-        assert!(msg.contains("slight < medium < open"), "{msg}");
+        assert!(msg.contains("partial < medium < open"), "{msg}");
     }
 
     #[test]
@@ -260,12 +296,12 @@ mode = "loopback"
 device = "alsa_output.pci-0000_00_1b.0.analog-stereo.monitor"
 
 [thresholds]
-slight = 0.01
+partial = 0.01
 medium = 0.05
 open = 0.12
 
 [engine]
-default_emotion = "calm"
+default_emotion = ""
 asset_root = "./assets"
 bind = "0.0.0.0:9000"
 

@@ -1,20 +1,26 @@
 # Rusty-Tuber
 
-A high-performance **PNG-Tuber** written in Rust. Drive a PNG avatar from your
-microphone volume and trigger emotions from a built-in web app, composited into
-**OBS** as a transparent Browser Source.
+A high-performance **PNG-Tuber** written in Rust. Drive a layered PNG avatar
+from your microphone volume and trigger eye-expression emotions from a built-in
+web app, composited into **OBS** as a transparent Browser Source.
 
+- **Layered compositing**: the avatar is a static body plus independent eye and
+  mouth layers (same canvas, stacked like a South-Park cutout). Only the mouth
+  and eyes swap — the body never reloads, so there's no flicker.
 - **Mic-driven mouth**: RMS loudness (with EMA smoothing) maps to four mouth
-  states (`closed → slight → medium → open`).
-- **Natural blinking**: a randomised, fully tunable blink scheduler; drop in
-  `-blink.png` variants to enable it per emotion. Manual eye override too.
-- **Emotions that auto-revert**: trigger an emotion and it returns to your
-  resting emotion after a configurable per-emotion timer (or stays until cleared).
-- **Data-driven assets**: drop a folder of PNGs to add an emotion — no code.
-  Partial frame sets are supported (a 2-frame emotion snaps to the nearest mouth;
-  same for blink variants).
-- **Web control + REST API**: a built-in panel (`/`) for clicking emotions, plus
-  a JSON WebSocket and REST endpoints for hotkeys / Stream Deck / automation.
+  levels (`closed → partial → medium → open`). Tune the pick-up thresholds and
+  toggle individual levels live from the panel's **Mouth tuning** card — disable
+  `closed` to make `partial` the resting mouth and A/B-test 3 vs 4 positions.
+- **Natural blinking**: a randomised, fully tunable blink scheduler; add
+  `eyes/closed.png` to enable it. Manual eye override too.
+- **Emotions as eye expressions**: an emotion is an optional eye-expression set
+  under `eyes/<emotion>/`; triggering it swaps the eye layer while the mouth
+  keeps reacting to the mic. Auto-reverts on a per-emotion timer.
+- **Data-driven assets**: drop in layered PNGs — no code. Partial mouth sets are
+  supported (a 2-frame set snaps to the nearest level).
+- **Web control + REST API**: a built-in panel (`/`) for triggering emotions,
+  changing the resting face (★), and driving overrides, with keyboard shortcuts
+  plus a JSON WebSocket and REST endpoints for hotkeys / Stream Deck / automation.
 - **Single self-contained binary**: the web UI is embedded; only the character
   PNGs live on disk.
 - **Designed for OBS**: point a Browser Source at the *stage* URL for a
@@ -70,50 +76,82 @@ and watch the mouth react to your mic. The repo ships placeholder art under
 > Use `stage.html` (bare avatar, transparent) for OBS, and `/` (control panel)
 > in your own browser. They share the same live state over WebSocket.
 
+### Control panel
+
+Open `http://<bind>/` for the control panel. Beyond clicking emotions, it can:
+
+- **Change the resting face** — click the ★ on any emotion to make it the
+  resting emotion (sends `SetDefault`). No need to edit `config.toml`.
+- **Force mouth / eyes** — override the mic or blink scheduler; `Auto` resumes.
+- **Tune the mouth mapping** — the **Mouth tuning** card (toggle to show) sets
+  which levels are active and the pick-up threshold for each. Sliders enforce
+  strict order (two can't be equal); uncheck `closed` to make `partial` the
+  resting mouth and compare 3 vs 4 positions in real time. Changes broadcast to
+  every panel and the running avatar.
+- **Keyboard shortcuts** — `1`–`9` trigger the first nine emotions, `0` clears
+  the override, `M` cycles the mouth, `E` cycles the eyes, `D` sets the current
+  emotion as resting. A `<kbd>` badge on each button shows its shortcut.
+- **Live volume meter** with a peak-hold marker, a connection status with
+  reconnect countdown, and a Copy button for the stage URL.
+
+The panel works on a phone or tablet (it stacks vertically on narrow screens),
+so you can use it as a wireless Stream Deck on the same network. Errors and
+disconnects surface as toasts rather than silently failing.
+
 ---
 
-## Asset layout
+## Asset layout (layered)
+
+The avatar is a stack of independent transparent PNG **layers**, all sharing the
+same canvas size, composited bottom-up like a South-Park cutout. The body stays
+static; only the mouth and eye layers swap.
 
 ```
-assets/characters/<character>/<emotion>/<mouth>.png
+assets/characters/<character>/
+├── base/
+│   └── *.png            one or more static body images (stacked bottom-up, in
+│                         filename order). At least one is required.
+├── mouths/
+│   ├── closed.png       mouth level 0 — resting          (required)
+│   ├── partial.png      level 1                           (optional)
+│   ├── medium.png       level 2                           (optional)
+│   └── open.png         level 3 — fully open              (required)
+└── eyes/
+    ├── open.png         resting eyes                      (required)
+    ├── closed.png       eyes-closed (blink)               (optional)
+    └── <emotion>/       optional eye-expression sets (see below)
+        ├── open.png     this emotion's resting eyes       (required)
+        └── closed.png   this emotion's blink eyes         (optional)
 ```
 
-- `<emotion>` folders become emotion names (case-insensitive).
-- Each emotion folder **must** contain `closed.png` and `open.png` (eyes open).
-- `slight.png` and `medium.png` are **optional**. If absent, the resolver snaps
-  to the nearest available frame (e.g. an emotion with only `closed` + `open`
-  uses `closed` for `slight` and `open` for `medium`).
-- **Blinking**: add `<mouth>-blink.png` for the eyes-closed variant of any mouth
-  frame. The whole blink set is optional — if absent, blinks simply fall back to
-  the eyes-open frame. If present but partial, the resolver snaps to the nearest
-  available mouth **within** the eyes-closed set.
+- **Mouths** are driven by mic volume (`closed → partial → medium → open`).
+  `closed` and `open` are required; `partial`/`medium` are optional and the
+  resolver snaps to the nearest available level (e.g. a 2-frame set uses
+  `closed` for `partial` and `open` for `medium`).
+- **Eyes** blink between `open.png` and `closed.png`. If `closed.png` is absent
+  that expression simply doesn't blink (the `open` frame is reused).
+- **Emotions** are optional named eye-expression sets under `eyes/<emotion>/`.
+  Triggering an emotion swaps the **eye layer** to that expression; the mouth
+  keeps reacting to the mic. With no emotion folders, the avatar is just base +
+  blink + mic mouth. Add an emotion later by dropping in
+  `eyes/happy/open.png` (+ optional `closed.png`).
+
+PNGs must have an **alpha channel** so the layers composite cleanly. Point
+`[engine].asset_root` at the character folder.
 
 ```
-assets/characters/default_macaw/
-├── calm/
-│   ├── closed.png              (eyes open)
-│   ├── slight.png              (optional)
-│   ├── medium.png              (optional)
-│   ├── open.png
-│   ├── closed-blink.png        (eyes closed — shown during a blink)
-│   ├── slight-blink.png        (optional)
-│   ├── medium-blink.png        (optional)
-│   └── open-blink.png
-├── surprised/
-│   ├── closed.png
-│   ├── open.png
-│   ├── closed-blink.png        (only need the mouths a blink may cover)
-│   └── open-blink.png
-└── angry/
-    ├── closed.png              (no -blink art → blinks fall back to eyes-open)
-    └── open.png
+assets/characters/default_macaw/   (the bundled placeholder)
+├── base/body.png                  (static macaw body)
+├── mouths/closed.png
+├── mouths/partial.png
+├── mouths/medium.png
+├── mouths/open.png
+├── eyes/open.png                  (resting eyes)
+└── eyes/closed.png                (blink)
 ```
 
-PNGs should have an **alpha channel** (transparent background) so they composite
-cleanly in OBS. Point `[engine].asset_root` at the character folder you want.
-
-> Assets are loaded **once at startup** (per the chosen design). Restart the
-> server to pick up newly added emotion folders.
+> Assets are loaded **once at startup**. Restart the server to pick up newly
+> added layers or emotions.
 
 ### Regenerating the placeholder art
 
@@ -136,20 +174,23 @@ smoothing_factor = 0.35    # EMA weight on the newest RMS sample (0..1).
 mode = "input"             # "input" (mic) | "loopback" (system output)
 device = ""                # "" = system default; else a name from --list-audio-devices.
 
-[thresholds]               # RMS level that opens each mouth state. slight < medium < open.
-slight = 0.02
+[thresholds]               # RMS level that opens each mouth level. partial < medium < open.
+partial = 0.02
 medium = 0.08
 open = 0.18
+# Optional: active mouth levels (default = all four). The lowest enabled is the
+# resting mouth. Disable one to A/B-test fewer positions, e.g. 3:
+#   enabled = ["partial", "medium", "open"]
+# Also adjustable at runtime from the panel's "Mouth tuning" card.
 
 [engine]
-default_emotion = "calm"   # Resting emotion.
+default_emotion = ""       # Resting emotion (eye-set). Empty = base/default eyes.
+                           # If set, must name a folder under eyes/<name>/.
 asset_root = "./assets/characters/default_macaw"
 bind = "127.0.0.1:8080"    # OBS Browser Source points at http://<bind>/stage.html
 
 [timers]                   # Per-emotion auto-revert (seconds). Omit an emotion to make it stick.
-surprised = 2.5
-pleased = 3.0
-laughing = 1.5
+                           # Empty by default — add entries when you add emotion eye-sets.
 
 [blink]                    # Eye-blink scheduler. Optional — all keys have defaults.
 enabled = true             # Set false to disable blinking.
@@ -190,37 +231,50 @@ Messages use the envelope `{"type": "...", "payload": {...}}`.
 
 | type | payload | effect |
 |------|---------|--------|
-| `TriggerEmotion` | `{"emotion": "surprised"}` | Switch emotion; auto-revert on its timer. |
+| `TriggerEmotion` | `{"emotion": "happy"}` | Swap the eye layer to that expression; auto-revert on its timer. |
 | `ClearOverride` | — | Return to the resting emotion now. |
-| `SetDefault` | `{"emotion": "calm"}` | Change the resting emotion. |
-| `SetMouthOverride` | `{"mouth": "open"}` | Force a mouth shape (ignores mic). |
+| `SetDefault` | `{"emotion": "happy"}` | Change the resting emotion. |
+| `SetMouthOverride` | `{"mouth": "open"}` | Force a mouth level (ignores mic). |
 | `ClearMouthOverride` | — | Resume mic-driven mouth. |
+| `SetMouthConfig` | `{"config": {enabled, partial, medium, open}}` | Set active levels + pick-up thresholds (validated). |
 | `SetEyesOverride` | `{"eyes": "closed"}` | Force eyes open/closed (pauses blinking). |
 | `ClearEyesOverride` | — | Resume blinking. |
-| `Hello` | — | Optional handshake (no-op). |
+| `Hello` | — | Optional handshake (the built-in panel sends it on connect). |
 
 **Server → client:**
 
 | type | payload |
 |------|---------|
-| `Welcome` | `{"catalog": {...}, "default_emotion": "calm"}` (on connect) |
-| `StateUpdate` | `{"emotion", "mouth", "eyes", "volume", "overridden", "frame", "default_emotion"}` |
+| `Welcome` | `{"catalog": {base, mouths, default_eyes, emotions}, "default_emotion": "", "mouth_config": {enabled, partial, medium, open}}` (on connect) |
+| `StateUpdate` | `{"emotion", "mouth", "eyes", "volume", "overridden", "mouth_overridden", "eyes_overridden", "eyes_frame", "mouth_frame", "default_emotion"}` |
+| `MouthConfigUpdate` | `{"config": {enabled, partial, medium, open}}` (broadcast when the tuning changes) |
 | `Error` | `{"message": "..."}` |
 
 `StateUpdate` is sent immediately on any visible change and throttled to ~20 Hz
-for volume-only drift. `mouth` is one of `closed|slight|medium|open`, `eyes` is
-`open|closed`, and `frame` is the resolved `/frames/...` URL to display.
+for volume-only drift. `mouth` is one of `closed|partial|medium|open`, `eyes` is
+`open|closed`, and `eyes_frame` / `mouth_frame` are the resolved `/frames/...`
+layer URLs to stack over the static `base` layer. `overridden` is true if any
+override (emotion/mouth/eyes) is active; `mouth_overridden` / `eyes_overridden`
+flag the per-channel overrides so every client (panel, OBS source, phone, Stream
+Deck via REST) renders the same highlighted control without tracking local state.
+
+Errors from the REST API are returned as a JSON envelope `{"error": "..."}`
+with the appropriate status code (e.g. `404` for an unknown emotion, `400` for
+an invalid mouth/eyes value).
 
 ### REST
 
 | Method & path | Body | Effect |
 |---|---|---|
-| `GET  /api/catalog` | — | Emotions + frame map. |
+| `GET  /api/health` | — | Liveness probe → `{"status":"ok"}`. |
+| `GET  /api/catalog` | — | Layered asset catalog. |
 | `GET  /api/state` | — | Latest `StateUpdate` snapshot. |
+| `GET  /api/mouth-config` | — | Active mouth levels + thresholds. |
+| `POST /api/mouth-config` | `{enabled, partial, medium, open}` | Update mouth levels + thresholds. |
 | `POST /api/emotion/:name` | — | Trigger an emotion. |
 | `POST /api/clear` | — | Clear the override. |
 | `POST /api/default/:name` | — | Set the resting emotion. |
-| `POST /api/mouth/:mouth` | — | Force a mouth (`closed|slight|medium|open`). |
+| `POST /api/mouth/:mouth` | — | Force a mouth (`closed|partial|medium|open`). |
 | `POST /api/mouth` | — | Release a forced mouth. |
 | `POST /api/eyes/:state` | — | Force eyes (`open|closed`). |
 | `POST /api/eyes` | — | Release a forced eye state (resume blinking). |
@@ -234,8 +288,8 @@ curl -X POST http://127.0.0.1:8080/api/emotion/surprised
 ### Static routes
 
 - `GET /` — control panel (embedded HTML/JS).
-- `GET /stage.html` — OBS stage (transparent, bare avatar).
-- `GET /frames/<emotion>/<file>.png` — character frames served from the asset root.
+- `GET /stage.html` — OBS stage (transparent; stacks base/eyes/mouth layers).
+- `GET /frames/<layer>/<file>.png` — character layers served from the asset root.
 
 ---
 
@@ -245,27 +299,42 @@ curl -X POST http://127.0.0.1:8080/api/emotion/surprised
 mic/loopback ──cpal──▶ audio (RMS + EMA) ─┐
                                            ├─▶ state task (single owner)
 web app ──WS/REST──▶ net ───────────────┘        │  effective (emotion, mouth, eyes, volume)
-   ▲                                             ▼
-   └── StateUpdate (debounced) ◀──────── net (broadcast)
+   ▲                                             │  → resolves eye + mouth layer URLs
+   └── StateUpdate (eyes_frame, mouth_frame) ◀── net (broadcast)
                           │
                           ▼
-   OBS Browser Source ◀─ HTTP (frames) + WS (state)
+   OBS Browser Source ◀─ HTTP (layers) + WS (state)
+                         base / eyes / mouth stacked in the browser
 ```
 
 - **`config.rs`** — typed, validated `config.toml` parsing (incl. `[blink]`).
-- **`assets.rs`** — catalog loader + nearest-frame fallback quantizer across the
-  `(mouth, eyes)` grid.
+- **`assets.rs`** — layered catalog loader (base/mouths/eyes + emotion eye-sets)
+  + nearest-level fallback quantizer for partial mouth sets.
 - **`audio.rs`** — cpal capture, lock-free RMS/EMA, `list-audio-devices`.
-- **`state.rs`** — single async owner; token-race-safe revert timers (a stale
-  timer can never clobber a newer emotion — the bug the original SDD design had),
-  plus the randomised blink scheduler.
-- **`protocol.rs`** — serde message types + the shared `MouthState`/`EyeState`.
-- **`net.rs`** — axum router: embedded UI, `ServeDir` for frames, WS, REST,
+- **`state.rs`** — single async owner; resolves the current eye/mouth layer
+  URLs, token-race-safe revert timers (a stale timer can never clobber a newer
+  emotion — the bug the original SDD design had), plus the randomised blink
+  scheduler.
+- **`protocol.rs`** — serde message types + the shared `MouthState`/`EyeState`
+  and the layered `LayerCatalog`.
+- **`net.rs`** — axum router: embedded UI, `ServeDir` for layers, WS, REST,
   throttled broadcast, live snapshot for `/api/state`.
 
 The hot path (audio callback) only computes an RMS and maybe sends one channel
-message — no allocation, no locking, no image work. PNG decoding happens in
-OBS's browser process.
+message — no allocation, no locking, no image work. The callback body is wrapped
+in `catch_unwind` so a panic can't unwind across the realtime → FFI boundary, and
+PNG decoding happens in OBS's browser process.
+
+### Networking & security
+
+The server is designed to bind to loopback for a single user on one machine.
+The WebSocket upgrade rejects browser `Origin`s that aren't loopback or a
+private-LAN address, so a random website can't open the live control channel and
+drive your avatar; non-browser clients (OBS, curl, Stream Deck) send no `Origin`
+and are allowed. Concurrent WebSocket clients are capped (default 16) and
+inbound message size is bounded. Character frames are served with
+`Cache-Control: public, max-age=3600` since they're immutable for the process
+lifetime, keeping the first mouth/blink swap flicker-free.
 
 ---
 
@@ -274,7 +343,7 @@ OBS's browser process.
 ```bash
 cargo fmt --all --check
 cargo clippy --all-targets --all-features -- -D warnings
-cargo test --all-targets        # 38 tests: unit + HTTP/WS integration
+cargo test --all-targets        # unit + HTTP/WS integration
 cargo machete                   # no unused deps
 cargo audit                     # no known advisories
 RUST_LOG=debug cargo run        # verbose logging
