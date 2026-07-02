@@ -21,7 +21,7 @@ struct Cli {
 enum Command {
     /// List audio devices reported by cpal, marking loopback (monitor) sources.
     ListAudioDevices,
-    /// Run the server (default).
+    /// Run the headless avatar pipeline (default).
     Run,
 }
 

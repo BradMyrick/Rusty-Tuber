@@ -41,42 +41,70 @@ pub struct RenderRequest {
     pub version: u64,
 }
 
-/// Dedicated render thread: polls the state watch and composites the latest
-/// state. If state changes mid-render, the next render uses the latest — no
-/// stale backlogs.
+/// Dedicated render thread: blocks on the state watch (zero idle wakeups) and
+/// composites the latest state. If state changes mid-render, the next render
+/// uses the latest — no stale backlogs. Runs on its own OS thread with a
+/// single-threaded runtime just to drive the watch future, keeping the heavy
+/// compositing off the async runtime's worker threads.
 pub fn spawn_renderer(
     compositor: Arc<Compositor>,
     state_rx: watch::Receiver<RenderRequest>,
     frame_tx: watch::Sender<Arc<Frame>>,
 ) {
-    std::thread::spawn(move || {
-        let mut last_version = u64::MAX;
-        loop {
-            if state_rx.has_changed().unwrap_or(false) {
-                let req = state_rx.borrow().clone();
-                if req.version == last_version {
-                    continue;
+    std::thread::Builder::new()
+        .name("render".into())
+        .spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("render runtime");
+            rt.block_on(async move {
+                let mut state_rx = state_rx;
+                let mut last_version = u64::MAX;
+                // Frame-rate cap: the webcam consumes at most ~30 fps, so
+                // rendering faster than that (e.g. many worm-frame advances) is
+                // wasted work. Coalesce bursts by waiting out the remainder of
+                // the cap window, then compositing the latest state seen.
+                let mut ready_at: Option<Instant> = None;
+                loop {
+                    // Park until the state actually changes; no busy-polling.
+                    if state_rx.changed().await.is_err() {
+                        break; // state task dropped the sender -> shutdown
+                    }
+                    if let Some(t) = ready_at {
+                        let now = Instant::now();
+                        if now < t {
+                            tokio::time::sleep_until(t.into()).await;
+                        }
+                    }
+                    let req = state_rx.borrow().clone();
+                    if req.version == last_version {
+                        continue;
+                    }
+                    last_version = req.version;
+                    let frame = compositor.render(
+                        req.emotion.as_deref(),
+                        req.mouth,
+                        req.eyes,
+                        &req.anim_frames,
+                    );
+                    let _ = frame_tx.send(Arc::new(frame));
+                    ready_at = Some(Instant::now() + RENDER_FRAME_MIN);
                 }
-                last_version = req.version;
-                let frame = compositor.render(
-                    req.emotion.as_deref(),
-                    req.mouth,
-                    req.eyes,
-                    &req.anim_frames,
-                );
-                let _ = frame_tx.send(Arc::new(frame));
-            } else {
-                std::thread::sleep(Duration::from_millis(2));
-            }
-        }
-    });
+            });
+        })
+        .expect("spawn render thread");
 }
 
 /// Minimum interval between volume-only broadcasts (meter refresh cap).
 const VOLUME_BROADCAST_INTERVAL: Duration = Duration::from_millis(50);
 
+/// Minimum interval between composites (~33 fps cap). The webcam consumes at
+/// most ~30 fps, so rendering faster (frequent worm-frame advances) is wasted.
+const RENDER_FRAME_MIN: Duration = Duration::from_millis(30);
+
 /// Commands accepted by the state task.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum StateCommand {
     /// Smoothed RMS volume in roughly `[0.0, 1.0]`, from the audio analyser.
     SetVolume(f32),
@@ -384,7 +412,11 @@ impl StateMachine {
                     }
                 }
             }
-            StateCommand::Shutdown => unreachable!("handled by the run loop"),
+            StateCommand::Shutdown => {
+                // Reached only if the run loop didn't intercept it; a no-op is
+                // safe and keeps the match exhaustive without panicking.
+                debug!("state task received late Shutdown");
+            }
         }
     }
 
@@ -435,8 +467,16 @@ impl StateMachine {
         // `send` errors only when there are no receivers; that's fine.
         let _ = self.bcast.send(msg);
         // Re-composite the avatar only when the visible layers actually
-        // changed (skips volume-only meter drift), then push to sinks.
-        let key = (eyes_frame.clone(), mouth_frame.clone(), self.anim_version);
+        // changed (skips volume-only meter drift), then push to sinks. Worm
+        // frame index is part of the key only at rest: while talking the worms
+        // are hidden (empty anim), so their silent advancement must not trigger
+        // identical re-renders ~20×/s.
+        let anim_version = if mouth == MouthState::Closed {
+            self.anim_version
+        } else {
+            self.last_frame_keys.2
+        };
+        let key = (eyes_frame.clone(), mouth_frame.clone(), anim_version);
         if key != self.last_frame_keys {
             self.last_frame_keys = key;
             self.render_version = self.render_version.wrapping_add(1);

@@ -146,7 +146,6 @@ pub struct EngineSettings {
     #[serde(default)]
     pub default_emotion: String,
     pub asset_root: PathBuf,
-    pub bind: String,
 }
 
 fn default_true() -> bool {
@@ -198,8 +197,9 @@ impl Default for BlinkSettings {
 /// Virtual webcam output (Linux v4l2loopback). The avatar is composited over an
 /// opaque `background` colour (webcams carry no alpha) and written as BGR4. Use
 /// a chroma colour (default green) so consumers can key it out for transparency.
-/// The webcam runs at `fps` while the avatar is moving and drops to `idle_fps`
-/// while static to save CPU.
+/// The output rate is event-driven: a frame is written the instant the
+/// compositor produces one (coalesced to ~33 fps) and the loop parks at idle, so
+/// there is no separate frame-rate knob.
 #[derive(Debug, Clone, Deserialize)]
 pub struct WebcamSettings {
     #[serde(default)]
@@ -207,25 +207,12 @@ pub struct WebcamSettings {
     /// `/dev/videoN` path; empty = auto-detect the first v4l2loopback device.
     #[serde(default)]
     pub device: String,
-    /// Active frame rate while the avatar is moving (talking/blink/emotion).
-    #[serde(default = "default_fps")]
-    pub fps: u32,
-    /// Idle frame rate while the avatar is static (keeps the feed alive for
-    /// consumers without burning CPU at the full rate).
-    #[serde(default = "default_idle_fps")]
-    pub idle_fps: u32,
     /// Hex colour (e.g. `#00ff00`) used to fill transparent areas. Default green
     /// for chroma keying.
     #[serde(default = "default_background")]
     pub background: String,
 }
 
-fn default_fps() -> u32 {
-    30
-}
-fn default_idle_fps() -> u32 {
-    8
-}
 fn default_background() -> String {
     "#00ff00".into()
 }
@@ -235,8 +222,6 @@ impl Default for WebcamSettings {
         Self {
             enabled: false,
             device: String::new(),
-            fps: 30,
-            idle_fps: 8,
             background: "#00ff00".into(),
         }
     }
@@ -278,10 +263,6 @@ impl AppConfig {
     /// Enforce structural invariants. Does not check that the asset catalog
     /// exists on disk (that happens later, non-fatally).
     pub fn validate(&self) -> Result<()> {
-        if self.engine.bind.trim().is_empty() {
-            bail!("[engine].bind must not be empty");
-        }
-
         let t = &self.thresholds;
         if !(t.partial < t.medium && t.medium < t.open) {
             bail!(
@@ -359,7 +340,6 @@ open = 0.18
 [engine]
 default_emotion = "calm"
 asset_root = "./assets"
-bind = "127.0.0.1:8080"
 "#;
 
     #[test]
@@ -415,7 +395,6 @@ open = 0.12
 [engine]
 default_emotion = ""
 asset_root = "./assets"
-bind = "0.0.0.0:9000"
 
 [timers]
 surprised = 2.5
@@ -425,7 +404,6 @@ surprised = 2.5
         assert_eq!(cfg.audio.sample_rate, 48000);
         assert_eq!(cfg.audio.latency, LatencyMode::Stable);
         assert_eq!(cfg.audio.effective_buffer_size(), 1024);
-        assert_eq!(cfg.engine.bind, "0.0.0.0:9000");
         assert_eq!(cfg.timers.get("surprised"), Some(&2.5_f32));
     }
 
