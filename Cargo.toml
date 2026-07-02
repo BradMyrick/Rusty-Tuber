@@ -3,7 +3,7 @@ name = "rusty-tuber"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.75"
-description = "High-performance PNG-Tuber: drive a PNG avatar from your mic and emote via a webapp, composited into OBS as a Browser Source."
+description = "Headless high-performance PNG-Tuber: drive a PNG avatar from your mic into a virtual webcam (v4l2loopback)."
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/BradMyrick/Rusty-Tuber"
 
@@ -12,34 +12,34 @@ name = "rusty-tuber"
 path = "src/main.rs"
 
 [dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "fs", "signal", "io-util"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal", "io-util", "io-std"] }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
 toml = "0.8"
 cpal = "0.15"
-axum = { version = "0.7", features = ["ws"] }
-tower-http = { version = "0.5", features = ["fs", "trace", "set-header"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-rust-embed = "8"
-mime_guess = "2"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 rand = "0.8"
-futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
-tokio-stream = "0.1"
+wide = { version = "0.7", default-features = false }
 
 # Linux-only: v4l2loopback ioctl/write for the virtual webcam sink.
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
 
 [dev-dependencies]
-pretty_assertions = "1"
-tokio-tungstenite = { version = "0.23", features = ["connect"] }
-reqwest = { version = "0.12", default-features = false, features = ["json"] }
+serde_json = "1"
 
 [profile.release]
 lto = "thin"
 codegen-units = 1
 strip = true
+
+# For `perf` profiling: release optimisation but with symbols + frame pointers
+# so `perf record`/flamegraphs resolve function names. Build with:
+#   RUSTFLAGS="-C force-frame-pointers=yes" cargo build --profile=profiling
+[profile.profiling]
+inherits = "release"
+debug = true
+strip = false

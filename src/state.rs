@@ -41,42 +41,102 @@ pub struct RenderRequest {
     pub version: u64,
 }
 
-/// Dedicated render thread: polls the state watch and composites the latest
-/// state. If state changes mid-render, the next render uses the latest — no
-/// stale backlogs.
+/// Dedicated render thread: blocks on the state watch (zero idle wakeups) and
+/// composites the latest state. If state changes mid-render, the next render
+/// uses the latest — no stale backlogs. Runs on its own OS thread with a
+/// single-threaded runtime just to drive the watch future, keeping the heavy
+/// compositing off the async runtime's worker threads.
+///
+/// `frame_min` caps the composite rate so the producer cadence stays in
+/// lockstep with the device's advertised frame rate (set from `[webcam].fps`),
+/// avoiding wasted renders faster than the webcam can sink.
 pub fn spawn_renderer(
     compositor: Arc<Compositor>,
     state_rx: watch::Receiver<RenderRequest>,
     frame_tx: watch::Sender<Arc<Frame>>,
+    frame_min: Duration,
 ) {
-    std::thread::spawn(move || {
-        let mut last_version = u64::MAX;
-        loop {
-            if state_rx.has_changed().unwrap_or(false) {
-                let req = state_rx.borrow().clone();
-                if req.version == last_version {
-                    continue;
+    std::thread::Builder::new()
+        .name("render".into())
+        .spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("render runtime");
+            rt.block_on(async move {
+                let mut state_rx = state_rx;
+                let mut last_version = u64::MAX;
+                // Frame-rate cap: the webcam consumes at most the advertised
+                // fps, so rendering faster than that (e.g. many worm-frame
+                // advances) is wasted work. Coalesce bursts by waiting out the
+                // remainder of the cap window, then compositing the latest
+                // state seen.
+                let mut ready_at: Option<Instant> = None;
+                // Instrumentation: if a render ever exceeds the coalesce budget
+                // the mouth falls behind the mic, so track the worst render time
+                // and log it periodically alongside the frame count.
+                let mut renders: u64 = 0;
+                let mut max_render_us: u128 = 0;
+                let mut since_summary: u64 = 0;
+                loop {
+                    // Park until the state actually changes; no busy-polling.
+                    if state_rx.changed().await.is_err() {
+                        break; // state task dropped the sender -> shutdown
+                    }
+                    if let Some(t) = ready_at {
+                        let now = Instant::now();
+                        if now < t {
+                            tokio::time::sleep_until(t.into()).await;
+                        }
+                    }
+                    let req = state_rx.borrow().clone();
+                    if req.version == last_version {
+                        continue;
+                    }
+                    last_version = req.version;
+                    let t0 = Instant::now();
+                    let frame = compositor.render(
+                        req.emotion.as_deref(),
+                        req.mouth,
+                        req.eyes,
+                        &req.anim_frames,
+                    );
+                    let r_us = t0.elapsed().as_micros();
+                    let _ = frame_tx.send(Arc::new(frame));
+                    ready_at = Some(Instant::now() + frame_min);
+                    renders += 1;
+                    if r_us > max_render_us {
+                        max_render_us = r_us;
+                    }
+                    since_summary += 1;
+                    if since_summary >= 60 {
+                        debug!(
+                            renders,
+                            max_render_us,
+                            budget_us = frame_min.as_micros(),
+                            "render stats (last {} frames)",
+                            since_summary
+                        );
+                        since_summary = 0;
+                        max_render_us = 0;
+                    }
                 }
-                last_version = req.version;
-                let frame = compositor.render(
-                    req.emotion.as_deref(),
-                    req.mouth,
-                    req.eyes,
-                    &req.anim_frames,
-                );
-                let _ = frame_tx.send(Arc::new(frame));
-            } else {
-                std::thread::sleep(Duration::from_millis(2));
-            }
-        }
-    });
+            });
+        })
+        .expect("spawn render thread");
 }
 
 /// Minimum interval between volume-only broadcasts (meter refresh cap).
 const VOLUME_BROADCAST_INTERVAL: Duration = Duration::from_millis(50);
 
+/// Fallback minimum interval between composites (~33 fps / 30 ms cap). Used
+/// only by tests; production reads the cap from `[webcam].fps` and passes it to
+/// [`spawn_renderer`].
+#[cfg(test)]
+const RENDER_FRAME_MIN: Duration = Duration::from_millis(30);
+
 /// Commands accepted by the state task.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum StateCommand {
     /// Smoothed RMS volume in roughly `[0.0, 1.0]`, from the audio analyser.
     SetVolume(f32),
@@ -267,19 +327,21 @@ impl StateMachine {
             StateCommand::SetVolume(v) => {
                 self.volume = v.clamp(0.0, 1.0);
                 self.mouth = volume_to_mouth(self.volume, &self.mouth_config);
-                // High-frequency path: dedupe identical visible state and
-                // throttle volume-only drift to keep the meter fresh.
+                // High-frequency path (~172 Hz): do the cheap dedupe check first
+                // with borrowed values, and only allocate the emotion String when
+                // we actually need to broadcast (~20 Hz / on visible change).
                 let now = Instant::now();
-                let emotion = self.effective_emotion().to_string();
                 let mouth = self.effective_mouth();
                 let eyes = self.effective_eyes();
-                let changed = emotion != self.last_sent_emotion
+                let changed = self.effective_emotion()
+                    != self.last_sent_emotion
                     || mouth != self.last_sent_mouth
                     || eyes != self.last_sent_eyes;
                 if changed
                     || now.duration_since(self.last_vol_broadcast)
                         >= VOLUME_BROADCAST_INTERVAL
                 {
+                    let emotion = self.effective_emotion().to_string();
                     self.broadcast(&emotion, mouth, eyes, now);
                 }
             }
@@ -384,7 +446,11 @@ impl StateMachine {
                     }
                 }
             }
-            StateCommand::Shutdown => unreachable!("handled by the run loop"),
+            StateCommand::Shutdown => {
+                // Reached only if the run loop didn't intercept it; a no-op is
+                // safe and keeps the match exhaustive without panicking.
+                debug!("state task received late Shutdown");
+            }
         }
     }
 
@@ -415,28 +481,42 @@ impl StateMachine {
             )
             .unwrap_or_default();
         let mouth_frame = self.catalog.mouth_frame(mouth).unwrap_or_default();
-        let emotion_overridden = self.emotion_override.is_some();
-        let mouth_overridden = self.mouth_override.is_some();
-        let eyes_overridden = self.eyes_override.is_some();
-        let overridden =
-            emotion_overridden || mouth_overridden || eyes_overridden;
-        let msg = ServerMessage::StateUpdate {
-            emotion: emotion.to_string(),
-            mouth,
-            eyes,
-            volume: self.volume,
-            overridden,
-            mouth_overridden,
-            eyes_overridden,
-            eyes_frame: eyes_frame.clone(),
-            mouth_frame: mouth_frame.clone(),
-            default_emotion: self.default_emotion.clone(),
-        };
-        // `send` errors only when there are no receivers; that's fine.
-        let _ = self.bcast.send(msg);
+        // Only construct + send the (allocation-heavy) StateUpdate when there's
+        // at least one subscriber. In headless mode there are none, so this
+        // whole block is skipped — the eyes_frame/mouth_frame above are still
+        // computed because the render-key logic below needs them.
+        if self.bcast.receiver_count() > 0 {
+            let emotion_overridden = self.emotion_override.is_some();
+            let mouth_overridden = self.mouth_override.is_some();
+            let eyes_overridden = self.eyes_override.is_some();
+            let overridden =
+                emotion_overridden || mouth_overridden || eyes_overridden;
+            let msg = ServerMessage::StateUpdate {
+                emotion: emotion.to_string(),
+                mouth,
+                eyes,
+                volume: self.volume,
+                overridden,
+                mouth_overridden,
+                eyes_overridden,
+                eyes_frame: eyes_frame.clone(),
+                mouth_frame: mouth_frame.clone(),
+                default_emotion: self.default_emotion.clone(),
+            };
+            // `send` errors only when there are no receivers; that's fine.
+            let _ = self.bcast.send(msg);
+        }
         // Re-composite the avatar only when the visible layers actually
-        // changed (skips volume-only meter drift), then push to sinks.
-        let key = (eyes_frame.clone(), mouth_frame.clone(), self.anim_version);
+        // changed (skips volume-only meter drift), then push to sinks. Worm
+        // frame index is part of the key only at rest: while talking the worms
+        // are hidden (empty anim), so their silent advancement must not trigger
+        // identical re-renders ~20×/s.
+        let anim_version = if mouth == MouthState::Closed {
+            self.anim_version
+        } else {
+            self.last_frame_keys.2
+        };
+        let key = (eyes_frame.clone(), mouth_frame.clone(), anim_version);
         if key != self.last_frame_keys {
             self.last_frame_keys = key;
             self.render_version = self.render_version.wrapping_add(1);
@@ -625,7 +705,7 @@ mod tests {
         let (cat, root) = setup();
         let catalog = Arc::new(cat);
         let compositor =
-            Arc::new(Compositor::new(catalog.clone(), &root).unwrap());
+            Arc::new(Compositor::new(catalog.clone(), &root, None).unwrap());
         let anim_count: usize =
             compositor.anim_config().iter().map(|c| c.instances).sum();
         let mut timers = HashMap::new();
@@ -642,7 +722,7 @@ mod tests {
             anim_frames: vec![0; anim_count],
             version: 0,
         });
-        spawn_renderer(compositor, render_rx, frame_tx);
+        spawn_renderer(compositor, render_rx, frame_tx, RENDER_FRAME_MIN);
         let handle = spawn(
             catalog,
             mouth_config(),

@@ -73,7 +73,7 @@ impl MouthState {
 /// positions. Thresholds must stay strictly ordered `partial < medium < open`
 /// regardless of which levels are enabled (disabled levels' thresholds are
 /// simply unused until re-enabled).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MouthConfig {
     pub enabled: [bool; 4],
     pub partial: f32,
@@ -134,7 +134,7 @@ impl MouthConfig {
 /// (smaller = snappier), `release_ms` how gently it closes on talk-end (larger =
 /// smoother, less flutter). Drives the asymmetric one-pole envelope in the audio
 /// callback; adjustable live from the panel.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EnvelopeConfig {
     pub attack_ms: f32,
     pub release_ms: f32,
