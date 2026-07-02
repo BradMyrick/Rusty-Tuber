@@ -90,7 +90,16 @@ pub async fn run(cfg: config::AppConfig) -> Result<()> {
     #[cfg(target_os = "linux")]
     let webcam_rx = frame_tx.subscribe();
 
-    state::spawn_renderer(compositor.clone(), render_rx, frame_tx.clone());
+    // Producer cadence matches the device's advertised frame rate so renders
+    // never outpace what the webcam can sink (and what it advertises via S_PARM).
+    let render_frame_min =
+        std::time::Duration::from_secs_f32(1.0 / cfg.webcam.fps as f32);
+    state::spawn_renderer(
+        compositor.clone(),
+        render_rx,
+        frame_tx.clone(),
+        render_frame_min,
+    );
 
     let state_handle = state::spawn(
         catalog.clone(),
@@ -112,13 +121,28 @@ pub async fn run(cfg: config::AppConfig) -> Result<()> {
     #[cfg(target_os = "linux")]
     if cfg.webcam.enabled {
         match (webcam::find_device(&cfg.webcam.device), cfg.webcam.background_rgb()) {
-            (Some(dev), Ok(bg)) => {
-                if let Err(e) = webcam::spawn_webcam(
-                    webcam_rx,
-                    dev.clone(),
-                    bg,
+            (Some(dev), Ok(solid)) => {
+                match webcam::Background::load(
+                    &cfg.webcam.background_image,
+                    solid,
+                    cfg.webcam.output_size,
                 ) {
-                    warn!(error = %format!("{e:#}"), "webcam output disabled");
+                    Ok(bg) => {
+                        if let Err(e) = webcam::spawn_webcam(
+                            webcam_rx,
+                            dev.clone(),
+                            bg,
+                            cfg.webcam.format,
+                            cfg.webcam.fps,
+                            cfg.webcam.steady,
+                        ) {
+                            warn!(error = %format!("{e:#}"), "webcam output disabled");
+                        }
+                    }
+                    Err(e) => warn!(
+                        error = %format!("{e:#}"),
+                        "webcam disabled (could not load [webcam].background_image)",
+                    ),
                 }
             }
             (None, _) => warn!(

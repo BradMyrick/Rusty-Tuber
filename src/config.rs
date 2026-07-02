@@ -37,6 +37,22 @@ pub enum AudioMode {
     Loopback,
 }
 
+/// Virtual-camera pixel format written to the v4l2loopback device.
+///
+/// - `Yuyv` (default): the universally-accepted webcam format — every browser,
+///   Cheese, Zoom, Meet, OBS, and Discord see it. Half the bandwidth of BGR4.
+///   Requires an even `[webcam].output_size`.
+/// - `Bgr4`: v4l2loopback's native 32-bit BGRX. Cheapest to produce from RGBA
+///   but rejected by some capture stacks (notably Chrome/Firefox), so it is an
+///   opt-in for setups that need it.
+#[derive(Debug, Clone, Copy, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum WebcamFormat {
+    #[default]
+    Yuyv,
+    Bgr4,
+}
+
 /// Audio capture latency preset. `low` uses small buffers (~256 frames, ~6 ms
 /// at 44.1 kHz) for snappy mouth response; `stable` uses larger buffers
 /// (~1024, ~23 ms) for setups that glitch at small buffer sizes.
@@ -195,11 +211,12 @@ impl Default for BlinkSettings {
 }
 
 /// Virtual webcam output (Linux v4l2loopback). The avatar is composited over an
-/// opaque `background` colour (webcams carry no alpha) and written as BGR4. Use
-/// a chroma colour (default green) so consumers can key it out for transparency.
-/// The output rate is event-driven: a frame is written the instant the
-/// compositor produces one (coalesced to ~33 fps) and the loop parks at idle, so
-/// there is no separate frame-rate knob.
+/// opaque `background` colour (webcams carry no alpha) and written in `format`
+/// (default YUYV). Use a chroma colour (default green) so consumers can key it
+/// out for transparency. The device advertises `fps` via `VIDIOC_S_PARM` so
+/// readers (OBS / ffplay / browsers) can lock pacing, and the compositor
+/// coalesces renders to the same rate, so the producer and advertised device
+/// rate stay in lockstep.
 #[derive(Debug, Clone, Deserialize)]
 pub struct WebcamSettings {
     #[serde(default)]
@@ -211,13 +228,37 @@ pub struct WebcamSettings {
     /// at load and the whole pipeline (composite, alpha-over blend, device
     /// write) runs at this size, so cost scales with pixels — 512² is ~16×
     /// cheaper than the typical 2048² art and is plenty for a webcam source
-    /// that OBS scales anyway.
+    /// that OBS scales anyway. Must be even when `format == Yuyv`.
     #[serde(default = "default_output_size")]
     pub output_size: u32,
     /// Hex colour (e.g. `#00ff00`) used to fill transparent areas. Default green
     /// for chroma keying.
     #[serde(default = "default_background")]
     pub background: String,
+    /// Pixel format: `yuyv` (default, max compatibility) or `bgr4` (opt-in).
+    #[serde(default)]
+    pub format: WebcamFormat,
+    /// Advertised device frame rate (fps). Set via `VIDIOC_S_PARM`; also caps
+    /// the compositor's render rate so the two stay in lockstep. 30 is the safe
+    /// default that OBS, browsers, and conferencing apps all handle.
+    #[serde(default = "default_fps")]
+    pub fps: u32,
+    /// Optional background image composited behind the avatar (overrides the
+    /// flat `background` colour). A path relative to the working dir, e.g.
+    /// `"backgrounds/studio.png"`. Use this for apps that don't support chroma
+    /// keying (Google Meet, Discord background blur uses segmentation, not a
+    /// colour key, so a flat green shows through as green). Empty = use the
+    /// solid `background` colour (the chroma-key workflow for OBS).
+    #[serde(default)]
+    pub background_image: String,
+    /// Emit a constant frame stream at `fps` even when the avatar is idle
+    /// (default on). This makes the device behave like a real camera and is
+    /// **required for OBS**: OBS paces its V4L2 source by frame timestamps, so
+    /// an event-driven writer that parks during silence makes OBS stall, then
+    /// backlog up to ~1 s when speech resumes. Cost at 512² is ~1–2 % CPU.
+    /// Disable (`false`) to restore event-driven, zero-idle-CPU behaviour.
+    #[serde(default = "default_steady")]
+    pub steady: bool,
 }
 
 fn default_background() -> String {
@@ -225,6 +266,12 @@ fn default_background() -> String {
 }
 fn default_output_size() -> u32 {
     512
+}
+fn default_fps() -> u32 {
+    30
+}
+fn default_steady() -> bool {
+    true
 }
 
 impl Default for WebcamSettings {
@@ -234,6 +281,10 @@ impl Default for WebcamSettings {
             device: String::new(),
             output_size: 512,
             background: "#00ff00".into(),
+            format: WebcamFormat::Yuyv,
+            fps: 30,
+            background_image: String::new(),
+            steady: true,
         }
     }
 }
@@ -311,6 +362,18 @@ impl AppConfig {
                 "[webcam].output_size must be in [16, 8192] (got {})",
                 self.webcam.output_size
             );
+        }
+        if self.webcam.format == WebcamFormat::Yuyv
+            && self.webcam.output_size % 2 != 0
+        {
+            bail!(
+                "[webcam].output_size must be even when [webcam].format = \"yuyv\" \
+                 (got {}; use an even value or format = \"bgr4\")",
+                self.webcam.output_size
+            );
+        }
+        if !(1..=120).contains(&self.webcam.fps) {
+            bail!("[webcam].fps must be in [1, 120] (got {})", self.webcam.fps);
         }
 
         for (name, secs) in &self.timers {
@@ -457,5 +520,61 @@ surprised = 2.5
         );
         assert!(mk("[blink]\nduration = 0.0\n").is_err());
         assert!(mk("[blink]\ndouble_chance = 2.0\n").is_err());
+    }
+
+    #[test]
+    fn webcam_defaults_to_yuyv_and_30fps() {
+        let cfg = AppConfig::from_toml_str(MINIMAL).unwrap();
+        assert_eq!(cfg.webcam.format, WebcamFormat::Yuyv);
+        assert_eq!(cfg.webcam.fps, 30);
+    }
+
+    #[test]
+    fn webcam_parses_bgr4_format_and_custom_fps() {
+        let raw = format!(
+            "{MINIMAL}\n[webcam]\nenabled = true\nformat = \"bgr4\"\nfps = 24\n"
+        );
+        let cfg = AppConfig::from_toml_str(&raw).unwrap();
+        assert!(cfg.webcam.enabled);
+        assert_eq!(cfg.webcam.format, WebcamFormat::Bgr4);
+        assert_eq!(cfg.webcam.fps, 24);
+    }
+
+    #[test]
+    fn webcam_rejects_odd_size_for_yuyv() {
+        let mk = |toml: &str| {
+            AppConfig::from_toml_str(&format!("{MINIMAL}\n{toml}"))
+        };
+        // YUYV (default format) needs an even edge length.
+        assert!(mk("[webcam]\noutput_size = 513\n").is_err());
+        // Odd size is fine with BGR4.
+        assert!(mk("[webcam]\noutput_size = 513\nformat = \"bgr4\"\n").is_ok());
+    }
+
+    #[test]
+    fn webcam_rejects_bad_fps() {
+        let mk = |toml: &str| {
+            AppConfig::from_toml_str(&format!("{MINIMAL}\n{toml}"))
+        };
+        assert!(mk("[webcam]\nfps = 0\n").is_err());
+        assert!(mk("[webcam]\nfps = 121\n").is_err());
+        assert!(mk("[webcam]\nfps = 60\n").is_ok());
+    }
+
+    #[test]
+    fn webcam_defaults_steady_and_no_bg_image() {
+        let cfg = AppConfig::from_toml_str(MINIMAL).unwrap();
+        assert!(cfg.webcam.steady);
+        assert!(cfg.webcam.background_image.is_empty());
+    }
+
+    #[test]
+    fn webcam_parses_bg_image_and_steady_off() {
+        let raw = format!(
+            "{MINIMAL}\n[webcam]\nbackground_image = \"backgrounds/office.png\"\nsteady = false\n"
+        );
+        let cfg = AppConfig::from_toml_str(&raw).unwrap();
+        assert_eq!(cfg.webcam.background_image, "backgrounds/office.png");
+        assert!(!cfg.webcam.steady);
     }
 }

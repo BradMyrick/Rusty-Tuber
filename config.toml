@@ -6,7 +6,7 @@ sample_rate = 44100      # Target sample rate (Hz). cpal negotiates; not guarant
 latency = "low"          # "low" (~256-frame buffers, ~6ms) | "stable" (~1024, ~23ms)
 # buffer_size = 256      # Optional explicit override; omit to use the latency preset.
 attack_ms = 1            # Envelope attack — mouth-open responsiveness. Smaller = snappier.
-release_ms = 20         # Envelope release — mouth-close smoothness. Larger = less flutter.
+release_ms = 40         # Envelope release — mouth-close smoothness. Larger = less flutter.
 mode = "input"           # "input" (mic) | "loopback" (system output via a monitor device)
 device = ""              # "" = system default. Else exact name from `rusty-tuber --list-audio-devices`.
 
@@ -37,15 +37,40 @@ duration = 0.12
 double_chance = 0.15
 
 # Virtual webcam output (Linux v4l2loopback). The single video output: the
-# composited avatar over `background` (BGR4). OBS / Zoom / Discord / the panel
-# all read it as a normal camera; add a Chroma Key filter to drop the background.
-# The output is event-driven: a frame is written the instant the compositor
-# produces one (coalesced to ~33 fps) and the loop parks at idle, so there is
-# no separate frame-rate knob.
+# composited avatar over `background` (a chroma colour or a background image).
+# OBS / Zoom / Discord / the panel all read it as a normal camera. For OBS, add
+# a Chroma Key filter to drop a flat chroma background; for Meet/Discord (which
+# can't chroma key) use a background_image instead.
 [webcam]
 enabled = true
 device = ""              # "/dev/videoN", or "" to auto-detect.
 output_size = 512        # Square output edge (px). Layers scale to this at load;
-                         # the whole pipeline runs at this size, so smaller = far
-                         # less CPU. 512 is plenty for a webcam source OBS scales.
-background = "#00ff00"  # #rrggbb chroma fill (webcams carry no alpha).
+                          # the whole pipeline runs at this size, so smaller = far
+                          # less CPU. 512 is plenty for a webcam source OBS scales.
+                          # Must be even when format = "yuyv".
+format = "yuyv"         # "yuyv" (default; works in OBS, browsers, Cheese, Zoom,
+                          # Meet, Discord — half the bandwidth of BGR4) | "bgr4"
+                          # (v4l2loopback native; faster to produce but rejected
+                          # by Chrome/Firefox). Use yuyv unless you have a reason.
+fps = 30                 # Advertised device frame rate (VIDIOC_S_PARM) and the
+                          # compositor's render-rate cap. Lets OBS / ffplay / web
+                          # clients lock pacing instead of free-running (which
+                          # causes the 200-700ms reader-side lag at 0 fps). 30 is
+                          # the safe default; 24 for a film look, 60 for smoother
+                          # motion at higher CPU.
+steady = true           # Constant-fps output even when idle (default on). REQUIRED
+                          # for OBS: an event-driven writer that parks during
+                          # silence makes OBS stall then backlog up to ~1s when you
+                          # resume talking (intermittent lag, worst on start/stop).
+                          # Costs ~1-2% CPU at 512². Set false only for WebRTC-only
+                          # setups (Discord/Meet) that prefer zero idle CPU.
+background = "#FF00FF"  # #rrggbb chroma fill used when no background_image is set
+                          # (webcams carry no alpha). Add a Chroma Key filter in OBS
+                          # to drop it. Ignored while background_image is set.
+background_image = ""  #"assets/backgrounds/background1.png"    # Optional background image composited behind the avatar
+                          # (overrides the flat chroma `background`). A path
+                          # relative to the working dir, e.g.
+                          # "assets/backgrounds/background1.png". Use this for
+                          # apps that don't chroma key (Google Meet / Discord use
+                          # segmentation, so a flat green shows through). "" = use
+                          # the solid `background` colour (the OBS chroma-key path).

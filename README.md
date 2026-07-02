@@ -13,9 +13,11 @@ Zoom, Discord, and browsers all read as a normal camera.
   consumer to drop the background.
 - **Low-latency audio.** An asymmetric envelope follower (fast attack, gentle
   release) plus a low-latency buffer preset make the mouth feel instant.
-- **Event-driven webcam.** A frame is written the instant the compositor
-  produces one (coalesced to ~33 fps) and the loop parks at idle, so silence
-  costs ~zero CPU and there's no poll latency.
+- **Camera-style webcam.** By default the device emits a constant `[webcam].fps`
+  stream (like a real webcam) — required for OBS, which paces its V4L2 source by
+  frame timestamps and otherwise stalls/backlogs. Output is `YUYV` by default
+  (works in OBS, browsers, Cheese, Zoom, Meet, Discord), with `VIDIOC_S_PARM`
+  advertising the frame rate so readers lock pacing.
 - **Layered compositing.** The avatar is a static body plus independent eye and
   mouth layers (same canvas, stacked like a South-Park cutout).
 - **Mic-driven mouth.** RMS loudness maps to four mouth levels
@@ -60,7 +62,7 @@ INFO loaded asset catalog emotions=[] base=["base/body.png"]
 INFO loaded animation group group=worms instances=5 frames=2
 INFO compositor ready width=2048 height=2048 layers=4 anim_instances=5
 INFO auto-detected v4l2loopback device device=/dev/video2 name=Rusty-Tuber
-INFO virtual webcam output started (BGR4) device=/dev/video2 fps=30 idle_fps=8
+INFO virtual webcam output started device=/dev/video2 width=512 height=512 format=Yuyv fps=30
 INFO audio capture running
 INFO control interface ready on stdin — type `help` for commands (Ctrl-C to quit)
 INFO rusty-tuber running headless; type `help` on stdin for commands, Ctrl-C to quit
@@ -83,6 +85,15 @@ sudo modprobe v4l2loopback exclusive_caps=1 card_label="Rusty-Tuber" video_nr=2
 > **Use `exclusive_caps=1`.** With it, the device advertises CAPTURE-only caps
 > while a writer is active, which is what OBS / desktop Zoom / Meet expect from
 > the `write()` output path Rusty-Tuber uses.
+>
+> **Browsers (Chrome/Firefox) and Cheese/Guvcview need the device actively
+> producing when they enumerate.** With `exclusive_caps=1` the device only shows
+> up once Rusty-Tuber is running and has set the format — so start Rusty-Tuber
+> *first*, then (re)start/refresh the browser or camera app. Rusty-Tuber also
+> advertises a frame rate via `VIDIOC_S_PARM` (`[webcam].fps`) and outputs `YUYV`
+> by default, both of which are required for browsers/Cheese to accept the
+> device; setting `[webcam].format = "bgr4"` opts out (faster, but Chrome/Firefox
+> won't see it).
 
 The server auto-detects the device (or set `[webcam].device = "/dev/videoN"`).
 Enable it in `config.toml` (`[webcam] enabled = true`) and (re)start.
@@ -109,11 +120,19 @@ number and update `[webcam].device` to match.)
 ### Add it to OBS / Zoom / Discord
 
 1. In OBS: **Sources → add → Video Capture Device (V4L2)** → pick **Rusty-Tuber**.
-2. Add a **Chroma Key** filter, key colour `#00ff00` (the `[webcam].background`).
-3. Zoom/Discord/browsers: select **Rusty-Tuber** as the camera the same way.
-
-Webcams carry no alpha, so the avatar sits on the chroma background; the key
-filter drops it.
+2. Set **Frame rate** to match `[webcam].fps` (30) and **Buffering → None** for
+   the lowest-latency preview (Buffering = Auto can add a few frames of delay).
+   Keep `[webcam].steady = true` (the default) — OBS paces its V4L2 source by
+   frame timestamps, so an idle-parking writer makes OBS stall, then backlog up
+   to ~1 s when you resume talking. The steady stream keeps the queue shallow.
+3. Pick a background strategy:
+   - **Chroma key (OBS):** leave `background_image` empty, keep
+     `background = "#00ff00"`, and add a **Chroma Key** filter (key `#00ff00`).
+   - **Background image (Meet/Discord/Zoom):** set
+     `background_image = "assets/backgrounds/<name>.png"` — the avatar is
+     composited over the image, no keying needed. (Meet/Discord blur/replacement
+     use ML segmentation, not a colour key, so a flat green shows through.)
+4. Zoom/Discord/browsers: select **Rusty-Tuber** as the camera the same way.
 
 ---
 
@@ -283,10 +302,44 @@ device = ""                # "/dev/videoN", or "" to auto-detect.
 output_size = 512          # Square output edge (px). Layers scale to this at load
                            # and the whole pipeline runs at this size — cost scales
                            # with pixels, so this is the biggest perf lever. 512 is
-                           # plenty for a webcam source OBS scales anyway.
+                           # plenty for a webcam source OBS scales anyway. Must be
+                           # even when format = "yuyv".
 background = "#00ff00"     # #rrggbb chroma fill (webcams carry no alpha).
-                           # Output is event-driven (~33 fps cap), no knob.
+format = "yuyv"            # "yuyv" (default; works in OBS, browsers, Cheese, Zoom,
+                           # Meet, Discord — half the bandwidth of BGR4) | "bgr4"
+                           # (faster to produce but Chrome/Firefox reject it).
+fps = 30                   # Advertised device frame rate (VIDIOC_S_PARM) and the
+                           # compositor's render-rate cap. Lets OBS / ffplay / web
+                           # clients lock pacing instead of free-running (which at
+                           # 0 fps causes 200–700 ms reader-side lag). 24 = film
+                           # look, 60 = smoother motion at higher CPU.
+steady = true              # Constant-fps output even when idle (default on).
+                           # REQUIRED for OBS: an event-driven writer that parks
+                           # during silence makes OBS stall then backlog up to ~1 s
+                           # when you resume talking (intermittent lag, worst on
+                           # start/stop). ~1–2 % CPU at 512². Set false only for
+                           # WebRTC-only (Discord/Meet) where zero idle CPU matters.
+background_image = ""      # Optional background image composited behind the avatar
+                           # (overrides the flat chroma `background`). A path
+                           # relative to the working dir, e.g.
+                           # "assets/backgrounds/background1.png". For apps that
+                           # can't chroma key (Google Meet / Discord blur use ML
+                           # segmentation, not a colour key, so flat green shows
+                           # through). "" = solid `background` (the OBS chroma path).
 ```
+
+> **Why `fps` matters.** v4l2loopback reports `0.000 fps` until the writer calls
+> `VIDIOC_S_PARM`. With no frame interval, OBS/ffplay can't lock pacing and
+> accumulate latency (smooth but ~half a second behind), while browsers/Cheese
+> reject the device entirely. Rusty-Tuber advertises `[webcam].fps` and renders at
+> the same rate, so producer and consumer stay in lockstep.
+>
+> **Backgrounds vs chroma key.** A flat `background = "#00ff00"` + a Chroma Key
+> filter (OBS) is the classic transparent-background workflow. But Google Meet,
+> Discord, and Zoom blur/replacement use **ML segmentation**, not a colour key, so
+> a flat green shows through as green — set `background_image` to composite a real
+> image behind the avatar instead (no keying needed). Drop your images in
+> `assets/backgrounds/`.
 
 If `[audio].device` is empty, `mode = "input"` uses the system default mic and
 `mode = "loopback"` uses the first device whose name contains `monitor`.
@@ -318,7 +371,7 @@ stdin ──text commands──▶ control ────────────�
                                                                   │  → COMPOSITOR renders one RGBA frame on visible change
    ┌──────────────────────────────────────────────────────────────┘  (watch channel)
    ▼
-   webcam sink ──BGR4 + chroma bg──▶  /dev/videoN (v4l2loopback)
+   webcam sink ──YUYV/BGR4 + chroma bg──▶  /dev/videoN (v4l2loopback)
                                           │
    OBS / Zoom / Discord ◀── read as a normal camera (+ Chroma Key)
 ```
@@ -334,15 +387,15 @@ stdin ──text commands──▶ control ────────────�
   the static base, and renders each frame via a bounding-box-cropped alpha-over
   of the eye/mouth/anim layers (sparse layers touch only their occupied pixels).
 - **`state.rs`** — single async owner; resolves state and posts a lightweight
-  `RenderRequest` to a dedicated render thread (coalesced to ~33 fps, since the
-  webcam can't consume more). Token-race-safe revert timers, the blink
+  `RenderRequest` to a dedicated render thread (coalesced to `[webcam].fps`,
+  since the webcam can't consume more). Token-race-safe revert timers, the blink
   scheduler, and runtime mouth-config + envelope.
 - **`webcam.rs`** *(Linux)* — v4l2loopback sink: alpha-overs the avatar onto the
-  chroma background with a SIMD (`wide`) RGBA→BGR4 convert, and writes
-  **event-driven and non-blocking** — a frame the instant the compositor posts
-  one, opening the device `O_NONBLOCK` so a busy reader (OBS) surfaces as a
-  *dropped* frame (smooth) instead of *blocking* (laggy); parks at idle for
-  ~zero CPU; auto-detects the device.
+  chroma background with an RGBA→YUYV (or BGR4) convert, advertises the frame
+  interval via `VIDIOC_S_PARM`, and writes **event-driven and non-blocking** — a
+  frame the instant the compositor posts one, opening the device `O_NONBLOCK` so
+  a busy reader (OBS) surfaces as a *dropped* frame (smooth) instead of
+  *blocking* (laggy); parks at idle for ~zero CPU; auto-detects the device.
 - **`control.rs`** — dependency-free stdin command reader; the seam for hotkeys
   / a future control server.
 - **`protocol.rs`** — serde message types, `MouthState`/`EyeState`, the layered
@@ -373,9 +426,14 @@ DEBUG webcam write stats (last 60 frames) written=300 skipped=0 max_write_us=162
 
 If you ever see `max_render_us` approach `budget_us`, or `skipped` climbing
 (reader can't keep up), that's the smoking gun. Otherwise the pipeline is
-healthy and any perceived lag is downstream of `/dev/videoN` — isolate it with
-`ffplay /dev/video2` (or `mpv av://v4l2:/dev/video2`): snappy there but laggy in
-OBS ⇒ OBS-side buffering.
+healthy and any perceived lag is downstream of `/dev/videoN`. Confirm the device
+advertises a real frame rate — `v4l2-ctl --device=/dev/video2 --get-parm` should
+show `Frames per second: 30.000`, not `0.000` — then isolate with
+`ffplay /dev/video2` (or `mpv av://v4l2:/dev/video2`). If ffplay is snappy but
+OBS lags, it's OBS-side: set the V4L2 source **Buffering → None** and **Frame
+rate** to match `[webcam].fps`. (Before the `VIDIOC_S_PARM` fix the device
+reported `0.000 fps`, which made *both* OBS and ffplay free-run and accumulate
+200–700 ms — if that ever recurs, check `[webcam].fps` and the startup log.)
 
 For a CPU flamegraph, the repo ships a `[profile.profiling]` (release opts +
 symbols + frame pointers):

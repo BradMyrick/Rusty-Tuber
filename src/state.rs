@@ -46,10 +46,15 @@ pub struct RenderRequest {
 /// uses the latest — no stale backlogs. Runs on its own OS thread with a
 /// single-threaded runtime just to drive the watch future, keeping the heavy
 /// compositing off the async runtime's worker threads.
+///
+/// `frame_min` caps the composite rate so the producer cadence stays in
+/// lockstep with the device's advertised frame rate (set from `[webcam].fps`),
+/// avoiding wasted renders faster than the webcam can sink.
 pub fn spawn_renderer(
     compositor: Arc<Compositor>,
     state_rx: watch::Receiver<RenderRequest>,
     frame_tx: watch::Sender<Arc<Frame>>,
+    frame_min: Duration,
 ) {
     std::thread::Builder::new()
         .name("render".into())
@@ -61,10 +66,11 @@ pub fn spawn_renderer(
             rt.block_on(async move {
                 let mut state_rx = state_rx;
                 let mut last_version = u64::MAX;
-                // Frame-rate cap: the webcam consumes at most ~30 fps, so
-                // rendering faster than that (e.g. many worm-frame advances) is
-                // wasted work. Coalesce bursts by waiting out the remainder of
-                // the cap window, then compositing the latest state seen.
+                // Frame-rate cap: the webcam consumes at most the advertised
+                // fps, so rendering faster than that (e.g. many worm-frame
+                // advances) is wasted work. Coalesce bursts by waiting out the
+                // remainder of the cap window, then compositing the latest
+                // state seen.
                 let mut ready_at: Option<Instant> = None;
                 // Instrumentation: if a render ever exceeds the coalesce budget
                 // the mouth falls behind the mic, so track the worst render time
@@ -97,7 +103,7 @@ pub fn spawn_renderer(
                     );
                     let r_us = t0.elapsed().as_micros();
                     let _ = frame_tx.send(Arc::new(frame));
-                    ready_at = Some(Instant::now() + RENDER_FRAME_MIN);
+                    ready_at = Some(Instant::now() + frame_min);
                     renders += 1;
                     if r_us > max_render_us {
                         max_render_us = r_us;
@@ -107,7 +113,7 @@ pub fn spawn_renderer(
                         debug!(
                             renders,
                             max_render_us,
-                            budget_us = RENDER_FRAME_MIN.as_micros(),
+                            budget_us = frame_min.as_micros(),
                             "render stats (last {} frames)",
                             since_summary
                         );
@@ -123,8 +129,10 @@ pub fn spawn_renderer(
 /// Minimum interval between volume-only broadcasts (meter refresh cap).
 const VOLUME_BROADCAST_INTERVAL: Duration = Duration::from_millis(50);
 
-/// Minimum interval between composites (~33 fps cap). The webcam consumes at
-/// most ~30 fps, so rendering faster (frequent worm-frame advances) is wasted.
+/// Fallback minimum interval between composites (~33 fps / 30 ms cap). Used
+/// only by tests; production reads the cap from `[webcam].fps` and passes it to
+/// [`spawn_renderer`].
+#[cfg(test)]
 const RENDER_FRAME_MIN: Duration = Duration::from_millis(30);
 
 /// Commands accepted by the state task.
@@ -714,7 +722,7 @@ mod tests {
             anim_frames: vec![0; anim_count],
             version: 0,
         });
-        spawn_renderer(compositor, render_rx, frame_tx);
+        spawn_renderer(compositor, render_rx, frame_tx, RENDER_FRAME_MIN);
         let handle = spawn(
             catalog,
             mouth_config(),
