@@ -1,7 +1,7 @@
 //! Control interface: a dependency-free stdin command reader that drives the
 //! avatar by translating simple text commands into [`state::StateCommand`]s.
 //!
-//! This is the **control seam** for headless operation. Today it reads lines
+//! This is the **control seam** for headless operation. It reads lines
 //! from stdin; a future server, hotkey daemon, or Stream Deck integration can
 //! either pipe commands here, or — more directly — construct
 //! [`StateCommand`]s and feed the same `mpsc` sender the binary uses (see

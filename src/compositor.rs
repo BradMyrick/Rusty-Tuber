@@ -142,13 +142,23 @@ pub struct Compositor {
 
 impl Compositor {
     /// Decode every layer referenced by the catalog under `asset_root`.
-    pub fn new(catalog: Arc<AssetCatalog>, asset_root: &Path) -> Result<Self> {
+    ///
+    /// `output_size`, if set, scales every layer to that square edge at load
+    /// time (all character art is 1:1), so the whole pipeline — composite, blend,
+    /// device write — runs at that resolution instead of the (often much larger)
+    /// native art size. Cost scales with pixels, so this is the single biggest
+    /// perf lever for a webcam output.
+    pub fn new(
+        catalog: Arc<AssetCatalog>,
+        asset_root: &Path,
+        output_size: Option<u32>,
+    ) -> Result<Self> {
         let mut layers: HashMap<String, Layer> = HashMap::new();
 
         // Base.
         let mut base = Vec::new();
         for rel in &catalog.catalog().base {
-            decode_into(asset_root, rel, &mut layers)?;
+            decode_into(asset_root, rel, &mut layers, output_size)?;
             if let Some(layer) = layers.get(rel) {
                 base.push(layer.img.clone());
             }
@@ -172,27 +182,27 @@ impl Compositor {
             .into_iter()
             .flatten()
         {
-            decode_into(asset_root, rel, &mut layers)?;
+            decode_into(asset_root, rel, &mut layers, output_size)?;
         }
         // Default eyes + every emotion eye-set.
         let e = &catalog.catalog().default_eyes;
         if let Some(r) = &e.open {
-            decode_into(asset_root, r, &mut layers)?;
+            decode_into(asset_root, r, &mut layers, output_size)?;
         }
         if let Some(r) = &e.closed {
-            decode_into(asset_root, r, &mut layers)?;
+            decode_into(asset_root, r, &mut layers, output_size)?;
         }
         for set in catalog.catalog().emotions.values() {
             if let Some(r) = &set.open {
-                decode_into(asset_root, r, &mut layers)?;
+                decode_into(asset_root, r, &mut layers, output_size)?;
             }
             if let Some(r) = &set.closed {
-                decode_into(asset_root, r, &mut layers)?;
+                decode_into(asset_root, r, &mut layers, output_size)?;
             }
         }
 
         // Custom animation channels from character.toml.
-        let (anim_instances, anim_config) = load_anim(asset_root)?;
+        let (anim_instances, anim_config) = load_anim(asset_root, output_size)?;
 
         info!(
             width,
@@ -304,7 +314,11 @@ fn rel_of(url: &str) -> &str {
         .unwrap_or(url)
 }
 
-fn load_layer(root: &Path, rel: &str) -> Result<RgbaImage> {
+fn load_layer(
+    root: &Path,
+    rel: &str,
+    output_size: Option<u32>,
+) -> Result<RgbaImage> {
     let path = root.join(rel);
     let img = image::open(&path)
         .with_context(|| format!("compositor: decoding {}", path.display()))?;
@@ -312,7 +326,18 @@ fn load_layer(root: &Path, rel: &str) -> Result<RgbaImage> {
     if rgba.width() == 0 || rgba.height() == 0 {
         anyhow::bail!("compositor: empty image {}", path.display());
     }
-    Ok(rgba)
+    Ok(fit(rgba, output_size))
+}
+
+/// Scale a square layer to `output_size` (Lanczos3, one-time at load). No-op
+/// when `output_size` is `None` or already matches. All character art is 1:1.
+fn fit(img: RgbaImage, output_size: Option<u32>) -> RgbaImage {
+    match output_size {
+        Some(s) if s != img.width() || s != img.height() => {
+            imageops::resize(&img, s, s, imageops::FilterType::Lanczos3)
+        }
+        _ => img,
+    }
 }
 
 /// Decode `rel` into the shared layer cache (no-op if empty or already cached).
@@ -320,11 +345,12 @@ fn decode_into(
     root: &Path,
     rel: &str,
     layers: &mut HashMap<String, Layer>,
+    output_size: Option<u32>,
 ) -> Result<()> {
     if rel.is_empty() || layers.contains_key(rel) {
         return Ok(());
     }
-    let img = load_layer(root, rel)?;
+    let img = load_layer(root, rel, output_size)?;
     let bbox = opaque_bbox(&img);
     layers.insert(rel.to_string(), Layer { img, bbox });
     Ok(())
@@ -335,6 +361,7 @@ fn decode_into(
 /// animated layer, plus the timing config the scheduler needs.
 fn load_anim(
     root: &Path,
+    output_size: Option<u32>,
 ) -> Result<(Vec<AnimInstance>, Vec<AnimSchedulerConfig>)> {
     let toml_path = root.join("character.toml");
     if !toml_path.exists() {
@@ -359,6 +386,7 @@ fn load_anim(
                 let path = dir.join(&fname);
                 if path.exists() {
                     let img = image::open(&path)?.to_rgba8();
+                    let img = fit(img, output_size);
                     let bbox = opaque_bbox(&img);
                     frames.push(Layer { img, bbox });
                 } else {
@@ -452,7 +480,7 @@ mod tests {
     fn render_composites_and_resolves_nearest_mouth() {
         let dir = tempdir();
         let (cat, root) = fake_catalog(&dir);
-        let comp = Compositor::new(cat, &root).unwrap();
+        let comp = Compositor::new(cat, &root, None).unwrap();
         // Mouth=Partial snaps to closed (nearest). The top-left pixel should be
         // the mouth (green) since the mouth is drawn over the white eyes over
         // the red base — last-wins at (0,0) is mouth green.

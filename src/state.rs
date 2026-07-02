@@ -66,6 +66,12 @@ pub fn spawn_renderer(
                 // wasted work. Coalesce bursts by waiting out the remainder of
                 // the cap window, then compositing the latest state seen.
                 let mut ready_at: Option<Instant> = None;
+                // Instrumentation: if a render ever exceeds the coalesce budget
+                // the mouth falls behind the mic, so track the worst render time
+                // and log it periodically alongside the frame count.
+                let mut renders: u64 = 0;
+                let mut max_render_us: u128 = 0;
+                let mut since_summary: u64 = 0;
                 loop {
                     // Park until the state actually changes; no busy-polling.
                     if state_rx.changed().await.is_err() {
@@ -82,14 +88,32 @@ pub fn spawn_renderer(
                         continue;
                     }
                     last_version = req.version;
+                    let t0 = Instant::now();
                     let frame = compositor.render(
                         req.emotion.as_deref(),
                         req.mouth,
                         req.eyes,
                         &req.anim_frames,
                     );
+                    let r_us = t0.elapsed().as_micros();
                     let _ = frame_tx.send(Arc::new(frame));
                     ready_at = Some(Instant::now() + RENDER_FRAME_MIN);
+                    renders += 1;
+                    if r_us > max_render_us {
+                        max_render_us = r_us;
+                    }
+                    since_summary += 1;
+                    if since_summary >= 60 {
+                        debug!(
+                            renders,
+                            max_render_us,
+                            budget_us = RENDER_FRAME_MIN.as_micros(),
+                            "render stats (last {} frames)",
+                            since_summary
+                        );
+                        since_summary = 0;
+                        max_render_us = 0;
+                    }
                 }
             });
         })
@@ -295,19 +319,21 @@ impl StateMachine {
             StateCommand::SetVolume(v) => {
                 self.volume = v.clamp(0.0, 1.0);
                 self.mouth = volume_to_mouth(self.volume, &self.mouth_config);
-                // High-frequency path: dedupe identical visible state and
-                // throttle volume-only drift to keep the meter fresh.
+                // High-frequency path (~172 Hz): do the cheap dedupe check first
+                // with borrowed values, and only allocate the emotion String when
+                // we actually need to broadcast (~20 Hz / on visible change).
                 let now = Instant::now();
-                let emotion = self.effective_emotion().to_string();
                 let mouth = self.effective_mouth();
                 let eyes = self.effective_eyes();
-                let changed = emotion != self.last_sent_emotion
+                let changed = self.effective_emotion()
+                    != self.last_sent_emotion
                     || mouth != self.last_sent_mouth
                     || eyes != self.last_sent_eyes;
                 if changed
                     || now.duration_since(self.last_vol_broadcast)
                         >= VOLUME_BROADCAST_INTERVAL
                 {
+                    let emotion = self.effective_emotion().to_string();
                     self.broadcast(&emotion, mouth, eyes, now);
                 }
             }
@@ -447,25 +473,31 @@ impl StateMachine {
             )
             .unwrap_or_default();
         let mouth_frame = self.catalog.mouth_frame(mouth).unwrap_or_default();
-        let emotion_overridden = self.emotion_override.is_some();
-        let mouth_overridden = self.mouth_override.is_some();
-        let eyes_overridden = self.eyes_override.is_some();
-        let overridden =
-            emotion_overridden || mouth_overridden || eyes_overridden;
-        let msg = ServerMessage::StateUpdate {
-            emotion: emotion.to_string(),
-            mouth,
-            eyes,
-            volume: self.volume,
-            overridden,
-            mouth_overridden,
-            eyes_overridden,
-            eyes_frame: eyes_frame.clone(),
-            mouth_frame: mouth_frame.clone(),
-            default_emotion: self.default_emotion.clone(),
-        };
-        // `send` errors only when there are no receivers; that's fine.
-        let _ = self.bcast.send(msg);
+        // Only construct + send the (allocation-heavy) StateUpdate when there's
+        // at least one subscriber. In headless mode there are none, so this
+        // whole block is skipped — the eyes_frame/mouth_frame above are still
+        // computed because the render-key logic below needs them.
+        if self.bcast.receiver_count() > 0 {
+            let emotion_overridden = self.emotion_override.is_some();
+            let mouth_overridden = self.mouth_override.is_some();
+            let eyes_overridden = self.eyes_override.is_some();
+            let overridden =
+                emotion_overridden || mouth_overridden || eyes_overridden;
+            let msg = ServerMessage::StateUpdate {
+                emotion: emotion.to_string(),
+                mouth,
+                eyes,
+                volume: self.volume,
+                overridden,
+                mouth_overridden,
+                eyes_overridden,
+                eyes_frame: eyes_frame.clone(),
+                mouth_frame: mouth_frame.clone(),
+                default_emotion: self.default_emotion.clone(),
+            };
+            // `send` errors only when there are no receivers; that's fine.
+            let _ = self.bcast.send(msg);
+        }
         // Re-composite the avatar only when the visible layers actually
         // changed (skips volume-only meter drift), then push to sinks. Worm
         // frame index is part of the key only at rest: while talking the worms
@@ -665,7 +697,7 @@ mod tests {
         let (cat, root) = setup();
         let catalog = Arc::new(cat);
         let compositor =
-            Arc::new(Compositor::new(catalog.clone(), &root).unwrap());
+            Arc::new(Compositor::new(catalog.clone(), &root, None).unwrap());
         let anim_count: usize =
             compositor.anim_config().iter().map(|c| c.instances).sum();
         let mut timers = HashMap::new();

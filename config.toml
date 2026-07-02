@@ -45,4 +45,7 @@ double_chance = 0.15
 [webcam]
 enabled = true
 device = ""              # "/dev/videoN", or "" to auto-detect.
+output_size = 512        # Square output edge (px). Layers scale to this at load;
+                         # the whole pipeline runs at this size, so smaller = far
+                         # less CPU. 512 is plenty for a webcam source OBS scales.
 background = "#00ff00"  # #rrggbb chroma fill (webcams carry no alpha).

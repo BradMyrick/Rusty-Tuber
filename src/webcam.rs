@@ -15,6 +15,7 @@ use std::io::Write;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::watch;
 use tracing::{debug, info, warn};
 use wide::u32x8;
@@ -98,11 +99,14 @@ fn open_device(
     height: u32,
 ) -> Result<OwnedFd> {
     let path_str = path.to_str().unwrap_or("/dev/video0").to_owned();
-    // SAFETY: opening a device path with O_RDWR; the fd is wrapped in OwnedFd.
+    // O_NONBLOCK: a `write()` that can't be sunk right now (device/OBS not
+    // ready) returns EAGAIN instead of blocking, so device flow-control shows
+    // up as a dropped frame (smooth) rather than accumulating latency (laggy).
+    // The fd is wrapped in OwnedFd.
     let fd = unsafe {
         libc::open(
             std::ffi::CString::new(path_str).unwrap().as_ptr(),
-            libc::O_RDWR,
+            libc::O_RDWR | libc::O_NONBLOCK,
         )
     };
     if fd < 0 {
@@ -197,6 +201,16 @@ pub fn spawn_webcam(
                 let mut raw = FileFd(fd.as_raw_fd()); // borrows the fd; `fd` keeps it open
                 let mut frame_rx = frame_rx;
 
+                // Instrumentation: track write behaviour so we can see (via the
+                // periodic log line) whether the device is keeping up. High skip
+                // counts mean OBS/the device can't sink our rate; large write
+                // times would mean the driver is blocking despite O_NONBLOCK.
+                let mut written: u64 = 0;
+                let mut skipped: u64 = 0;
+                let mut max_write_us: u128 = 0;
+                let mut since_summary: u64 = 0;
+                let summary_every: u64 = 60;
+
                 // Mark the current (initial) value as seen so `changed()` only
                 // fires for *future* posts, then fall through to write it so the
                 // device has something to serve before the first change.
@@ -208,8 +222,51 @@ pub fn spawn_webcam(
                     if changed {
                         last = Some(frame.clone());
                         rgba_to_bgra(&frame, bg, &mut bgra);
-                        if raw.write_all(&bgra).is_err() {
-                            warn!("webcam write failed; continuing");
+                        let t0 = Instant::now();
+                        // Single non-blocking write of one whole frame. On EAGAIN
+                        // the device keeps serving the last good frame — skip
+                        // rather than block, so latency can never accumulate at
+                        // this boundary.
+                        match raw.write(&bgra) {
+                            Ok(n) => {
+                                if n != bgra.len() {
+                                    // v4l2loopback writes whole frames; a partial
+                                    // write would split the boundary, so drop it.
+                                    warn!(
+                                        wrote = n,
+                                        expected = bgra.len(),
+                                        "unexpected partial webcam write; dropping"
+                                    );
+                                    skipped += 1;
+                                } else {
+                                    written += 1;
+                                }
+                            }
+                            Err(e)
+                                if e.kind() == std::io::ErrorKind::WouldBlock =>
+                            {
+                                skipped += 1;
+                            }
+                            Err(e) => {
+                                warn!(error = %e, "webcam write failed; continuing");
+                                skipped += 1;
+                            }
+                        }
+                        let us = t0.elapsed().as_micros();
+                        if us > max_write_us {
+                            max_write_us = us;
+                        }
+                        since_summary += 1;
+                        if since_summary >= summary_every {
+                            debug!(
+                                written,
+                                skipped,
+                                max_write_us,
+                                "webcam write stats (last {} frames)",
+                                since_summary
+                            );
+                            since_summary = 0;
+                            max_write_us = 0;
                         }
                     }
                     // Block until the compositor posts a new frame. At idle this

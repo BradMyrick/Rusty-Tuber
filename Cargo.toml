@@ -35,3 +35,11 @@ serde_json = "1"
 lto = "thin"
 codegen-units = 1
 strip = true
+
+# For `perf` profiling: release optimisation but with symbols + frame pointers
+# so `perf record`/flamegraphs resolve function names. Build with:
+#   RUSTFLAGS="-C force-frame-pointers=yes" cargo build --profile=profiling
+[profile.profiling]
+inherits = "release"
+debug = true
+strip = false

@@ -207,6 +207,13 @@ pub struct WebcamSettings {
     /// `/dev/videoN` path; empty = auto-detect the first v4l2loopback device.
     #[serde(default)]
     pub device: String,
+    /// Edge length (px) of the square output frame. Layers are scaled to this
+    /// at load and the whole pipeline (composite, alpha-over blend, device
+    /// write) runs at this size, so cost scales with pixels — 512² is ~16×
+    /// cheaper than the typical 2048² art and is plenty for a webcam source
+    /// that OBS scales anyway.
+    #[serde(default = "default_output_size")]
+    pub output_size: u32,
     /// Hex colour (e.g. `#00ff00`) used to fill transparent areas. Default green
     /// for chroma keying.
     #[serde(default = "default_background")]
@@ -216,12 +223,16 @@ pub struct WebcamSettings {
 fn default_background() -> String {
     "#00ff00".into()
 }
+fn default_output_size() -> u32 {
+    512
+}
 
 impl Default for WebcamSettings {
     fn default() -> Self {
         Self {
             enabled: false,
             device: String::new(),
+            output_size: 512,
             background: "#00ff00".into(),
         }
     }
@@ -293,6 +304,13 @@ impl AppConfig {
         }
         if self.audio.effective_buffer_size() == 0 {
             bail!("[audio].buffer_size must be non-zero");
+        }
+
+        if !(16..=8192).contains(&self.webcam.output_size) {
+            bail!(
+                "[webcam].output_size must be in [16, 8192] (got {})",
+                self.webcam.output_size
+            );
         }
 
         for (name, secs) in &self.timers {

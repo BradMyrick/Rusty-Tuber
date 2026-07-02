@@ -54,6 +54,7 @@ pub async fn run(cfg: config::AppConfig) -> Result<()> {
     let compositor = Arc::new(compositor::Compositor::new(
         catalog.clone(),
         &cfg.engine.asset_root,
+        Some(cfg.webcam.output_size),
     )?);
     let anim_count: usize =
         compositor.anim_config().iter().map(|c| c.instances).sum();

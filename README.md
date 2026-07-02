@@ -280,8 +280,12 @@ double_chance = 0.15       # Probability of a quick double-blink.
 [webcam]                   # Virtual webcam (Linux v4l2loopback).
 enabled = true
 device = ""                # "/dev/videoN", or "" to auto-detect.
+output_size = 512          # Square output edge (px). Layers scale to this at load
+                           # and the whole pipeline runs at this size — cost scales
+                           # with pixels, so this is the biggest perf lever. 512 is
+                           # plenty for a webcam source OBS scales anyway.
 background = "#00ff00"     # #rrggbb chroma fill (webcams carry no alpha).
-                           # Output rate is event-driven (~33 fps cap), no knob.
+                           # Output is event-driven (~33 fps cap), no knob.
 ```
 
 If `[audio].device` is empty, `mode = "input"` uses the system default mic and
@@ -326,17 +330,19 @@ stdin ──text commands──▶ control ────────────�
 - **`audio.rs`** — cpal capture, asymmetric envelope follower, lock-free RMS,
   `list-audio-devices`.
 - **`compositor.rs`** — decodes layers once (caching each one's opaque bounding
-  box), pre-composites the static base, and renders each frame via a
-  bounding-box-cropped alpha-over of the eye/mouth/anim layers (sparse layers
-  touch only their occupied pixels).
+  box), scales them to `[webcam].output_size` (Lanczos3, one-time), pre-composites
+  the static base, and renders each frame via a bounding-box-cropped alpha-over
+  of the eye/mouth/anim layers (sparse layers touch only their occupied pixels).
 - **`state.rs`** — single async owner; resolves state and posts a lightweight
   `RenderRequest` to a dedicated render thread (coalesced to ~33 fps, since the
   webcam can't consume more). Token-race-safe revert timers, the blink
   scheduler, and runtime mouth-config + envelope.
 - **`webcam.rs`** *(Linux)* — v4l2loopback sink: alpha-overs the avatar onto the
   chroma background with a SIMD (`wide`) RGBA→BGR4 convert, and writes
-  **event-driven** — a frame the instant the compositor posts one, parking at
-  idle for ~zero CPU; skips identical frames; auto-detects the device.
+  **event-driven and non-blocking** — a frame the instant the compositor posts
+  one, opening the device `O_NONBLOCK` so a busy reader (OBS) surfaces as a
+  *dropped* frame (smooth) instead of *blocking* (laggy); parks at idle for
+  ~zero CPU; auto-detects the device.
 - **`control.rs`** — dependency-free stdin command reader; the seam for hotkeys
   / a future control server.
 - **`protocol.rs`** — serde message types, `MouthState`/`EyeState`, the layered
@@ -348,6 +354,38 @@ message — no allocation, no locking, no image work. The callback body is wrapp
 in `catch_unwind` so a panic can't unwind across the realtime → FFI boundary.
 Avatar compositing happens off the audio thread on a dedicated render thread,
 coalesced to the webcam's consumption rate.
+
+### Performance & profiling
+
+The pipeline cost scales with `[webcam].output_size`² (composite, alpha-over
+blend, and device write all touch every output pixel), so this is the dominant
+perf lever: 512² is ~16× cheaper than 2048² native art and is plenty for a
+webcam source that OBS scales anyway. At 512² a frame is render ~0.35 ms +
+write ~0.17 ms on a modest box — ~1% of the 30 ms budget.
+
+Built-in stage timings are logged at `debug` level every 60 frames — run with
+`RUST_LOG=debug` to see them:
+
+```
+DEBUG render stats (last 60 frames) renders=300 max_render_us=339 budget_us=30000
+DEBUG webcam write stats (last 60 frames) written=300 skipped=0 max_write_us=162
+```
+
+If you ever see `max_render_us` approach `budget_us`, or `skipped` climbing
+(reader can't keep up), that's the smoking gun. Otherwise the pipeline is
+healthy and any perceived lag is downstream of `/dev/videoN` — isolate it with
+`ffplay /dev/video2` (or `mpv av://v4l2:/dev/video2`): snappy there but laggy in
+OBS ⇒ OBS-side buffering.
+
+For a CPU flamegraph, the repo ships a `[profile.profiling]` (release opts +
+symbols + frame pointers):
+
+```bash
+sudo sysctl -w kernel.perf_event_paranoid=1   # one-time: let perf sample
+RUSTFLAGS="-C force-frame-pointers=yes" cargo build --profile=profiling
+perf record -F 999 -g -p $(pidof rusty-tuber) -- sleep 10
+perf report --no-children      # or: perf script | inferno-flamegraph > out.svg
+```
 
 ---
 
