@@ -5,8 +5,6 @@ avatar from your microphone volume (plus optional blinks and animations) and
 composite every frame into a **virtual webcam** (`v4l2loopback`) that OBS,
 Zoom, Discord, and browsers all read as a normal camera.
 
-- **No web UI, no server.** Pure Rust: mic → avatar → webcam. A tiny stdin
-  command interface is the control seam for hotkeys / scripts.
 - **Single universal output.** The compositor renders the avatar (static body +
   eye layer + mouth layer + animation overlays) into one RGBA frame on visible
   change and writes it to a v4l2loopback device. Add a Chroma Key filter in the
@@ -43,9 +41,6 @@ to build its audio backend), plus `v4l2loopback` for the virtual webcam:
 sudo apt-get install -y libasound2-dev pkg-config v4l2loopback-dkms v4l2loopback-utils
 # Fedora: sudo dnf install -y alsa-lib-devel v4l2loopback
 ```
-
-macOS and Windows need no extra system packages for audio, but the virtual
-webcam output is **Linux-only** (`[webcam]` is ignored elsewhere).
 
 ```bash
 # 1. Build
@@ -141,9 +136,10 @@ number and update `[webcam].device` to match.)
 
 ## Control interface (stdin)
 
-Rusty-Tuber runs **headless** — there is no web UI. Drive emotions and overrides
-by typing commands on stdin (or piping them in from a hotkey daemon / script).
-Commands are case-insensitive; blank lines are ignored.
+Rusty-Tuber runs **headless** — all behaviour is set in `config.toml`, and
+emotions / overrides are driven by typing commands on stdin (or piping them in
+from a hotkey daemon / script). Commands are case-insensitive; blank lines are
+ignored.
 
 | command | effect |
 |---------|--------|
