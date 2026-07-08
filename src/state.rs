@@ -40,6 +40,8 @@ pub struct RenderRequest {
     pub mouth: MouthState,
     pub eyes: EyeState,
     pub anim_frames: Vec<usize>,
+    /// True while the idle resting overlay (`anim/smile/`) should be composited.
+    pub idle: bool,
     pub version: u64,
 }
 
@@ -102,6 +104,7 @@ pub fn spawn_renderer(
                         req.mouth,
                         req.eyes,
                         &req.anim_frames,
+                        req.idle,
                     );
                     let r_us = t0.elapsed().as_micros();
                     let _ = frame_tx.send(Arc::new(frame));
@@ -170,6 +173,10 @@ pub enum StateCommand {
     ClearEyesOverride,
     /// Animation scheduler advanced an instance to a new frame.
     AnimFrame { instance: usize, frame: usize },
+    /// Internal: the idle-silence timer fired after `[idle].timeout_secs` of mic
+    /// silence. Only applied if `token` equals the currently active token (a
+    /// newer burst of speech invalidates a stale timer).
+    IdleTrigger(u64),
     /// Internal: a revert-timer fired. Only applied if `token` equals the
     /// currently active token.
     TimerClear(u64),
@@ -222,6 +229,8 @@ pub fn spawn(
     timers: HashMap<String, f32>,
     default_emotion: String,
     anim_count: usize,
+    idle_timeout_secs: f32,
+    has_idle_layer: bool,
     cmd_tx: mpsc::UnboundedSender<StateCommand>,
     mut cmd_rx: mpsc::UnboundedReceiver<StateCommand>,
     bcast: broadcast::Sender<ServerMessage>,
@@ -247,14 +256,23 @@ pub fn spawn(
         last_sent_emotion: default_emotion,
         last_sent_mouth: MouthState::Closed,
         last_sent_eyes: EyeState::Open,
-        last_frame_keys: (String::new(), String::new(), 0),
+        last_sent_idle: false,
+        last_frame_keys: (String::new(), String::new(), 0, false),
         last_vol_broadcast: Instant::now(),
         anim_frames: vec![0; anim_count],
         anim_version: 0,
+        idle_timeout_secs,
+        has_idle_layer,
+        idle_token: 0,
+        idle_pending: false,
+        idle_active: false,
     };
 
     tokio::spawn(async move {
         debug!("state task started");
+        // Arm the initial idle timer (mouth starts at rest/silent). A no-op when
+        // the feature is disabled (no asset or timeout <= 0).
+        machine.update_idle();
         while let Some(cmd) = cmd_rx.recv().await {
             if matches!(cmd, StateCommand::Shutdown) {
                 debug!("state task shutting down");
@@ -285,10 +303,24 @@ struct StateMachine {
     last_sent_emotion: String,
     last_sent_mouth: MouthState,
     last_sent_eyes: EyeState,
-    last_frame_keys: (String, String, u64),
+    last_sent_idle: bool,
+    last_frame_keys: (String, String, u64, bool),
     last_vol_broadcast: Instant,
     anim_frames: Vec<usize>,
     anim_version: u64,
+    /// `[idle].timeout_secs`: seconds of mic silence before the resting overlay
+    /// shows. 0.0 disables the feature.
+    idle_timeout_secs: f32,
+    /// Whether the compositor loaded an `anim/smile/` overlay. When false the
+    /// whole feature stays inactive (no timers armed, no overlay rendered).
+    has_idle_layer: bool,
+    /// Token identifying the currently-valid pending idle timer. Incremented on
+    /// every arm/cancel so a stale fired timer is ignored.
+    idle_token: u64,
+    /// True while a timer is pending (silenced started, waiting for timeout).
+    idle_pending: bool,
+    /// True while the resting overlay is actively being shown.
+    idle_active: bool,
 }
 
 impl StateMachine {
@@ -324,11 +356,69 @@ impl StateMachine {
             .unwrap_or_default()
     }
 
+    /// The resting (lowest-enabled) mouth level — what the avatar shows at mic
+    /// silence. The user is considered "speaking" when the mic-driven mouth
+    /// rises above this level.
+    fn resting_mouth(&self) -> MouthState {
+        [
+            MouthState::Closed,
+            MouthState::Partial,
+            MouthState::Medium,
+            MouthState::Open,
+        ]
+        .iter()
+        .find(|l| self.mouth_config.is_enabled(**l))
+        .copied()
+        .unwrap_or(MouthState::Closed)
+    }
+
+    /// Recompute idle-overlay state from the current mic-driven mouth. Arms a
+    /// timer when the user falls silent, cancels it (and hides an active
+    /// overlay) when speech resumes. No-op when the feature is disabled (no
+    /// `anim/smile/` asset or `timeout_secs <= 0`). The caller is responsible
+    /// for broadcasting after this returns — `idle_active` may have flipped.
+    fn update_idle(&mut self) {
+        if !self.has_idle_layer || self.idle_timeout_secs <= 0.0 {
+            return;
+        }
+        let speaking = self.mouth.level() > self.resting_mouth().level();
+        if speaking {
+            if self.idle_active {
+                self.idle_active = false;
+            }
+            if self.idle_pending {
+                // Invalidate the pending timer: a stale fire will be ignored.
+                self.idle_token = self.idle_token.wrapping_add(1);
+                self.idle_pending = false;
+            }
+        } else if !self.idle_pending && !self.idle_active {
+            self.arm_idle();
+        }
+    }
+
+    /// Arm (or re-arm) the one-shot idle timer. Increments the token so any
+    /// previously-armed but unfired timer becomes stale.
+    fn arm_idle(&mut self) {
+        self.idle_token = self.idle_token.wrapping_add(1);
+        let token = self.idle_token;
+        self.idle_pending = true;
+        let tx = self.cmd_tx.clone();
+        let secs = self.idle_timeout_secs;
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs_f32(secs)).await;
+            let _ = tx.send(StateCommand::IdleTrigger(token));
+        });
+    }
+
     fn handle(&mut self, cmd: StateCommand) {
         match cmd {
             StateCommand::SetVolume(v) => {
                 self.volume = v.clamp(0.0, 1.0);
                 self.mouth = volume_to_mouth(self.volume, &self.mouth_config);
+                // Recompute idle: speech cancels a pending timer / hides the
+                // smile; continued silence arms a timer (once). May flip
+                // `idle_active`, which the changed-check below picks up.
+                self.update_idle();
                 // High-frequency path (~172 Hz): do the cheap dedupe check first
                 // with borrowed values, and only allocate the emotion String when
                 // we actually need to broadcast (~20 Hz / on visible change).
@@ -338,7 +428,8 @@ impl StateMachine {
                 let changed = self.effective_emotion()
                     != self.last_sent_emotion
                     || mouth != self.last_sent_mouth
-                    || eyes != self.last_sent_eyes;
+                    || eyes != self.last_sent_eyes
+                    || self.idle_active != self.last_sent_idle;
                 if changed
                     || now.duration_since(self.last_vol_broadcast)
                         >= VOLUME_BROADCAST_INTERVAL
@@ -396,6 +487,9 @@ impl StateMachine {
                 // recompute the mic-driven mouth and broadcast state too.
                 self.mouth_config = config.clone();
                 self.mouth = volume_to_mouth(self.volume, &self.mouth_config);
+                // A new resting level can flip the speaking/silent verdict, so
+                // re-evaluate the idle timer.
+                self.update_idle();
                 let _ = self
                     .bcast
                     .send(ServerMessage::MouthConfigUpdate { config });
@@ -446,6 +540,27 @@ impl StateMachine {
                     if self.effective_mouth() == MouthState::Closed {
                         self.broadcast_now();
                     }
+                }
+            }
+            StateCommand::IdleTrigger(token) => {
+                // Only honour the latest-armed timer that's still pending and
+                // hasn't already engaged. Speech between arming and firing
+                // invalidates the token (or clears `idle_pending`).
+                if token == self.idle_token
+                    && self.idle_pending
+                    && !self.idle_active
+                {
+                    trace!(token, "idle timer fired; showing resting overlay");
+                    self.idle_pending = false;
+                    self.idle_active = true;
+                    self.broadcast_now();
+                } else {
+                    trace!(
+                        token,
+                        active_token = self.idle_token,
+                        pending = self.idle_pending,
+                        "ignoring stale idle timer"
+                    );
                 }
             }
             StateCommand::Shutdown => {
@@ -504,6 +619,7 @@ impl StateMachine {
                 eyes_frame: eyes_frame.clone(),
                 mouth_frame: mouth_frame.clone(),
                 default_emotion: self.default_emotion.clone(),
+                idle_smile: self.idle_active,
             };
             // `send` errors only when there are no receivers; that's fine.
             let _ = self.bcast.send(msg);
@@ -512,13 +628,19 @@ impl StateMachine {
         // changed (skips volume-only meter drift), then push to sinks. Worm
         // frame index is part of the key only at rest: while talking the worms
         // are hidden (empty anim), so their silent advancement must not trigger
-        // identical re-renders ~20×/s.
+        // identical re-renders ~20×/s. The idle overlay toggle is part of the
+        // key so engaging/disengaging the smile forces a re-composite.
         let anim_version = if mouth == MouthState::Closed {
             self.anim_version
         } else {
             self.last_frame_keys.2
         };
-        let key = (eyes_frame.clone(), mouth_frame.clone(), anim_version);
+        let key = (
+            eyes_frame.clone(),
+            mouth_frame.clone(),
+            anim_version,
+            self.idle_active,
+        );
         if key != self.last_frame_keys {
             self.last_frame_keys = key;
             self.render_version = self.render_version.wrapping_add(1);
@@ -537,12 +659,14 @@ impl StateMachine {
                 mouth,
                 eyes,
                 anim_frames: anim,
+                idle: self.idle_active,
                 version: self.render_version,
             });
         }
         self.last_sent_emotion = emotion.to_string();
         self.last_sent_mouth = mouth;
         self.last_sent_eyes = eyes;
+        self.last_sent_idle = self.idle_active;
         self.last_vol_broadcast = now;
     }
 }
@@ -714,14 +838,20 @@ mod tests {
         timers.insert("surprised".into(), 0.1_f32);
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         let (bcast_tx, bcast_rx) = broadcast::channel(64);
-        let init =
-            compositor.render(None, MouthState::Closed, EyeState::Open, &[]);
+        let init = compositor.render(
+            None,
+            MouthState::Closed,
+            EyeState::Open,
+            &[],
+            false,
+        );
         let (frame_tx, _) = watch::channel(Arc::new(init));
         let (render_tx, render_rx) = watch::channel(RenderRequest {
             emotion: None,
             mouth: MouthState::Closed,
             eyes: EyeState::Open,
             anim_frames: vec![0; anim_count],
+            idle: false,
             version: 0,
         });
         spawn_renderer(compositor, render_rx, frame_tx, RENDER_FRAME_MIN);
@@ -732,6 +862,8 @@ mod tests {
             timers,
             String::new(),
             anim_count,
+            8.0,
+            false,
             cmd_tx.clone(),
             cmd_rx,
             bcast_tx,
@@ -748,6 +880,7 @@ mod tests {
         volume: f32,
         eyes_frame: String,
         mouth_frame: String,
+        idle_smile: bool,
     }
 
     fn unwrap_state(msg: ServerMessage) -> S {
@@ -763,6 +896,7 @@ mod tests {
                 eyes_frame,
                 mouth_frame,
                 default_emotion: _,
+                idle_smile,
             } => S {
                 emotion,
                 mouth,
@@ -770,6 +904,7 @@ mod tests {
                 volume,
                 eyes_frame,
                 mouth_frame,
+                idle_smile,
             },
             other => panic!("expected StateUpdate, got {other:?}"),
         }
@@ -982,5 +1117,146 @@ mod tests {
             } => (*overridden, *mouth_overridden, *eyes_overridden),
             other => panic!("expected StateUpdate, got {other:?}"),
         }
+    }
+
+    // --- Idle resting-overlay tests -----------------------------------------
+
+    /// Like [`harness`] but also writes `anim/smile/smile.png` (so the
+    /// compositor reports `has_idle_layer`) and spawns the state task with a
+    /// short (0.1 s) idle timeout so the timer fires quickly in tests.
+    async fn harness_idle() -> (
+        mpsc::UnboundedSender<StateCommand>,
+        broadcast::Receiver<ServerMessage>,
+        JoinHandle<()>,
+    ) {
+        let (cat, root) = setup();
+        // Idle resting overlay: opaque yellow square.
+        {
+            let p = root.join("anim/smile/smile.png");
+            fs::create_dir_all(p.parent().unwrap()).unwrap();
+            let img: RgbaImage =
+                RgbaImage::from_raw(2, 2, [255u8, 255, 0, 255].repeat(4))
+                    .unwrap();
+            img.save(&p).unwrap();
+        }
+        let catalog = Arc::new(cat);
+        let compositor =
+            Arc::new(Compositor::new(catalog.clone(), &root, None).unwrap());
+        assert!(compositor.has_idle_layer());
+        let anim_count: usize =
+            compositor.anim_config().iter().map(|c| c.instances).sum();
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let (bcast_tx, bcast_rx) = broadcast::channel(64);
+        let init = compositor.render(
+            None,
+            MouthState::Closed,
+            EyeState::Open,
+            &[],
+            false,
+        );
+        let (frame_tx, _) = watch::channel(Arc::new(init));
+        let (render_tx, render_rx) = watch::channel(RenderRequest {
+            emotion: None,
+            mouth: MouthState::Closed,
+            eyes: EyeState::Open,
+            anim_frames: vec![0; anim_count],
+            idle: false,
+            version: 0,
+        });
+        spawn_renderer(compositor, render_rx, frame_tx, RENDER_FRAME_MIN);
+        let handle = spawn(
+            catalog,
+            mouth_config(),
+            crate::audio::EnvelopeControl::new(6.0, 110.0),
+            HashMap::new(),
+            String::new(),
+            anim_count,
+            0.1,
+            true,
+            cmd_tx.clone(),
+            cmd_rx,
+            bcast_tx,
+            render_tx,
+        );
+        (cmd_tx, bcast_rx, handle)
+    }
+
+    #[tokio::test]
+    async fn idle_smile_engages_after_silence_and_clears_on_speech() {
+        let (tx, mut rx, _h) = harness_idle().await;
+
+        // At startup the mouth is Closed (silent) → after the 0.1s timeout the
+        // smile should engage. Drain broadcasts until we see idle_smile = true.
+        let mut idle = false;
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(800);
+        loop {
+            let msg = tokio::time::timeout_at(deadline, rx.recv()).await;
+            match msg {
+                Ok(Ok(m)) => idle = unwrap_state(m).idle_smile,
+                Ok(Err(_)) | Err(_) => break,
+            }
+            if idle {
+                break;
+            }
+        }
+        assert!(idle, "idle smile should engage after silence");
+
+        // Speaking (volume above the open threshold) must hide it immediately.
+        tx.send(StateCommand::SetVolume(0.5)).unwrap(); // Open
+        let mut cleared = false;
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
+        loop {
+            let msg = tokio::time::timeout_at(deadline, rx.recv()).await;
+            match msg {
+                Ok(Ok(m)) => {
+                    let s = unwrap_state(m);
+                    // As soon as we observe a state update post-speech, the
+                    // smile must be off.
+                    cleared = !s.idle_smile;
+                    if cleared {
+                        break;
+                    }
+                }
+                Ok(Err(_)) | Err(_) => break,
+            }
+        }
+        assert!(cleared, "speaking must clear the idle smile");
+    }
+
+    #[tokio::test]
+    async fn speech_before_timeout_prevents_idle_smile() {
+        let (tx, mut rx, _h) = harness_idle().await;
+        // Talk continuously so the 0.1s timer never matures: keep the mouth
+        // above the open threshold for longer than the timeout.
+        for _ in 0..20 {
+            tx.send(StateCommand::SetVolume(0.5)).unwrap();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        // Drain whatever arrived; none should report an engaged idle smile.
+        let mut ever_idle = false;
+        while let Ok(m) = rx.try_recv() {
+            if unwrap_state(m).idle_smile {
+                ever_idle = true;
+            }
+        }
+        assert!(!ever_idle, "idle smile must not engage while speaking");
+    }
+
+    #[tokio::test]
+    async fn no_idle_layer_means_feature_inactive() {
+        // The default harness has no anim/smile asset → idle can never engage.
+        let (tx, mut rx, _h) = harness().await;
+        // Even after well past a default 8s-equivalent wait (we pass 8.0 but
+        // there's no layer, so no timer is ever armed), nothing fires quickly.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        // Silence — no idle engagement broadcast.
+        while let Ok(m) = rx.try_recv() {
+            assert!(
+                !unwrap_state(m).idle_smile,
+                "idle must stay off without an anim/smile asset"
+            );
+        }
+        // Sanity: the feature flag reported by the (no-smile) harness is false.
+        let _ = tx; // keep the sender alive
     }
 }

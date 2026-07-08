@@ -7,12 +7,12 @@
 
 use crate::assets::AssetCatalog;
 use crate::protocol::{EyeState, MouthState};
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use image::imageops;
 use image::RgbaImage;
 use serde::Deserialize;
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tracing::{info, warn};
 
@@ -138,6 +138,7 @@ pub struct Compositor {
     catalog: Arc<AssetCatalog>,
     anim_instances: Vec<AnimInstance>,
     anim_config: Vec<AnimSchedulerConfig>,
+    idle_layer: Option<Layer>,
 }
 
 impl Compositor {
@@ -204,6 +205,13 @@ impl Compositor {
         // Custom animation channels from character.toml.
         let (anim_instances, anim_config) = load_anim(asset_root, output_size)?;
 
+        // Idle resting overlay (the "smile after silence" feature). Optional;
+        // loaded from anim/smile/ if present.
+        let idle_layer = load_idle_layer(asset_root, output_size)?;
+        if idle_layer.is_some() {
+            info!("loaded idle resting overlay (anim/smile)");
+        }
+
         info!(
             width,
             height,
@@ -219,13 +227,22 @@ impl Compositor {
             catalog,
             anim_instances,
             anim_config,
+            idle_layer,
         })
+    }
+
+    /// True if an idle resting overlay (`anim/smile/*.png`) was loaded, i.e. the
+    /// "smile after silence" feature can ever engage.
+    pub fn has_idle_layer(&self) -> bool {
+        self.idle_layer.is_some()
     }
 
     /// Composite the avatar for the current state. Copies the pre-composited
     /// base (memcpy) then overlays the eye/mouth/anim layers. Each overlay is
     /// cropped to its precomputed opaque bounding box, so a sparse layer (a
     /// small worm sprite on a 2048² canvas) blends only its occupied pixels.
+    /// `show_idle` composites the idle resting overlay (`anim/smile/`) on top of
+    /// everything else — the character's "resting face" shown after silence.
     pub fn anim_config(&self) -> &[AnimSchedulerConfig] {
         &self.anim_config
     }
@@ -236,6 +253,7 @@ impl Compositor {
         mouth: MouthState,
         eyes: EyeState,
         anim_frames: &[usize],
+        show_idle: bool,
     ) -> Frame {
         let mut rgba = Vec::with_capacity(self.base_composited.len());
         rgba.extend_from_slice(&self.base_composited);
@@ -252,6 +270,11 @@ impl Compositor {
         for (i, inst) in self.anim_instances.iter().enumerate() {
             let f = anim_frames.get(i).copied().unwrap_or(0);
             if let Some(layer) = inst.frames.get(f) {
+                overlay_bbox(&mut rgba, layer, self.width);
+            }
+        }
+        if show_idle {
+            if let Some(layer) = &self.idle_layer {
                 overlay_bbox(&mut rgba, layer, self.width);
             }
         }
@@ -413,6 +436,63 @@ fn load_anim(
     Ok((instances, configs))
 }
 
+/// Load the idle resting overlay from `anim/smile/`. This is the character's
+/// "resting face" (e.g. a smile) shown on top of everything else after a
+/// configurable silence period.
+///
+/// The folder is optional — returns `Ok(None)` if it doesn't exist (the feature
+/// stays inactive). When it exists, a single PNG is picked: `smile.png` if
+/// present, otherwise the first PNG (sorted by name). Multiple frames aren't
+/// supported here (that's the `[[anim]]` random-cycle system's job); the idle
+/// overlay is one static layer.
+fn load_idle_layer(
+    root: &Path,
+    output_size: Option<u32>,
+) -> Result<Option<Layer>> {
+    let dir = root.join("anim").join("smile");
+    let mut paths: Vec<PathBuf> = match std::fs::read_dir(&dir) {
+        Ok(rd) => rd
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| {
+                p.is_file()
+                    && p.extension().and_then(|e| e.to_str()) == Some("png")
+            })
+            .collect(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(None);
+        }
+        Err(e) => {
+            return Err(e)
+                .with_context(|| format!("reading {}", dir.display()));
+        }
+    };
+    if paths.is_empty() {
+        warn!("anim/smile/ exists but contains no PNG; idle overlay disabled");
+        return Ok(None);
+    }
+    paths.sort();
+    // Prefer a file literally named smile.png; fall back to the first PNG.
+    let path = paths
+        .iter()
+        .find(|p| {
+            p.file_stem()
+                .and_then(|s| s.to_str())
+                .map(|s| s.eq_ignore_ascii_case("smile"))
+                .unwrap_or(false)
+        })
+        .or(paths.first())
+        .expect("paths is non-empty");
+    let img = image::open(path)
+        .with_context(|| format!("decoding idle overlay {}", path.display()))?
+        .to_rgba8();
+    if img.width() == 0 || img.height() == 0 {
+        bail!("idle overlay {} is empty", path.display());
+    }
+    let img = fit(img, output_size);
+    let bbox = opaque_bbox(&img);
+    Ok(Some(Layer { img, bbox }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -484,10 +564,47 @@ mod tests {
         // Mouth=Partial snaps to closed (nearest). The top-left pixel should be
         // the mouth (green) since the mouth is drawn over the white eyes over
         // the red base — last-wins at (0,0) is mouth green.
-        let frame = comp.render(None, MouthState::Partial, EyeState::Open, &[]);
+        let frame =
+            comp.render(None, MouthState::Partial, EyeState::Open, &[], false);
         assert_eq!((frame.width, frame.height), (2, 2));
         let p = &frame.rgba[0..4];
         assert_eq!(p, &[0, 255, 0, 255]); // green closed mouth wins
+    }
+
+    #[test]
+    fn idle_overlay_loads_and_renders_on_top() {
+        let dir = tempdir();
+        let (cat, root) = fake_catalog(&dir);
+        // Drop an idle smile PNG: opaque yellow, covering the whole canvas.
+        write_png(
+            &root.join("anim/smile/smile.png"),
+            &[255u8, 255, 0, 255].repeat(4),
+            2,
+            2,
+        );
+        let comp = Compositor::new(cat, &root, None).unwrap();
+        assert!(comp.has_idle_layer());
+        // Without idle: closed mouth green wins at (0,0).
+        let f1 =
+            comp.render(None, MouthState::Closed, EyeState::Open, &[], false);
+        assert_eq!(&f1.rgba[0..4], &[0, 255, 0, 255]);
+        // With idle: the yellow smile is composited on top of everything.
+        let f2 =
+            comp.render(None, MouthState::Closed, EyeState::Open, &[], true);
+        assert_eq!(&f2.rgba[0..4], &[255, 255, 0, 255]);
+    }
+
+    #[test]
+    fn idle_overlay_absent_means_feature_inactive() {
+        let dir = tempdir();
+        let (cat, root) = fake_catalog(&dir);
+        // No anim/smile/ folder.
+        let comp = Compositor::new(cat, &root, None).unwrap();
+        assert!(!comp.has_idle_layer());
+        // show_idle=true is a harmless no-op when no layer is loaded.
+        let f =
+            comp.render(None, MouthState::Closed, EyeState::Open, &[], true);
+        assert_eq!(&f.rgba[0..4], &[0, 255, 0, 255]);
     }
 
     // Minimal tempdir (avoid pulling `tempfile` just for these tests).

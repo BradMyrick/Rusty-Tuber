@@ -223,7 +223,8 @@ pub enum ServerMessage {
     /// for volume-only drift. `eyes_frame` / `mouth_frame` are the resolved
     /// layer paths to composite; the base layer is static and never changes.
     /// `overridden` is true if any override is active; `mouth_overridden` /
-    /// `eyes_overridden` flag the per-channel overrides.
+    /// `eyes_overridden` flag the per-channel overrides. `idle_smile` is true
+    /// while the idle resting overlay (`anim/smile/`) is being shown.
     StateUpdate {
         emotion: String,
         mouth: MouthState,
@@ -235,6 +236,7 @@ pub enum ServerMessage {
         eyes_frame: String,
         mouth_frame: String,
         default_emotion: String,
+        idle_smile: bool,
     },
     /// Posted when the mouth-level configuration changes, so subscribers stay
     /// in sync.
@@ -260,6 +262,7 @@ mod tests {
             eyes_frame: "/frames/eyes/happy/closed.png".into(),
             mouth_frame: "/frames/mouths/open.png".into(),
             default_emotion: "default".into(),
+            idle_smile: true,
         };
         let s = serde_json::to_string(&msg).unwrap();
         let back: ServerMessage = serde_json::from_str(&s).unwrap();

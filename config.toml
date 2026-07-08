@@ -35,6 +35,13 @@ max_interval = 6.0
 duration = 0.12
 double_chance = 0.15
 
+# Idle resting overlay (the "smile after silence" feature). After this many
+# seconds of mic silence, the anim/smile/*.png overlay is composited on top of
+# the avatar as its resting face; it disappears as soon as you speak. Only
+# active when an anim/smile/ asset exists. 0 disables it.
+[idle]
+timeout_secs = 8
+
 # Virtual webcam output (Linux v4l2loopback). The single video output: the
 # composited avatar over `background` (a chroma colour or a background image).
 # OBS / Zoom / Discord / the panel all read it as a normal camera. For OBS, add

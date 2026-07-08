@@ -24,6 +24,9 @@ Zoom, Discord, and browsers all read as a normal camera.
   (`closed → partial → medium → open`), tuned in `config.toml`.
 - **Natural blinking.** A randomised, tunable blink scheduler; add
   `eyes/closed.png` to enable it.
+- **Smile after silence.** Drop a PNG in `anim/smile/` and, after a
+  configurable silence (`[idle].timeout_secs`, default 8 s), it becomes the
+  resting face — cleared the instant you speak. Optional and per-character.
 - **Emotions as eye expressions.** An emotion is an optional eye-expression set
   under `eyes/<emotion>/`; triggering it swaps the eye layer while the mouth
   keeps reacting to the mic. Auto-reverts on a per-emotion timer.
@@ -193,12 +196,15 @@ assets/characters/<character>/
 │   ├── partial.png      level 1                           (optional)
 │   ├── medium.png       level 2                           (optional)
 │   └── open.png         level 3 — fully open              (required)
-└── eyes/
-    ├── open.png         resting eyes                      (required)
-    ├── closed.png       eyes-closed (blink)               (optional)
-    └── <emotion>/       optional eye-expression sets (see below)
-        ├── open.png     this emotion's resting eyes       (required)
-        └── closed.png   this emotion's blink eyes         (optional)
+├── eyes/
+│   ├── open.png         resting eyes                      (required)
+│   ├── closed.png       eyes-closed (blink)               (optional)
+│   └── <emotion>/       optional eye-expression sets (see below)
+│       ├── open.png     this emotion's resting eyes       (required)
+│       └── closed.png   this emotion's blink eyes         (optional)
+└── anim/
+    └── smile/
+        └── smile.png    idle resting overlay ("smile after silence") (optional)
 ```
 
 - **Mouths** are driven by mic volume (`closed → partial → medium → open`).
@@ -212,6 +218,12 @@ assets/characters/<character>/
   keeps reacting to the mic. With no emotion folders, the avatar is just base +
   blink + mic mouth. Add an emotion later by dropping in
   `eyes/happy/open.png` (+ optional `closed.png`).
+- **Idle smile** is an optional resting overlay under `anim/smile/`. After
+  `[idle].timeout_secs` (default 8 s) of mic silence the PNG is composited on
+  top of everything else as the character's "resting face"; it disappears the
+  moment speech resumes. With no `anim/smile/` folder the feature is a silent
+  no-op. It's a single static layer (for multi-frame animation use a `[[anim]]`
+  group instead).
 
 PNGs must have an **alpha channel** so the layers composite cleanly. Point
 `[engine].asset_root` at the character folder.
@@ -295,6 +307,12 @@ min_interval = 2.5         # Seconds between blinks (randomised in [min, max]).
 max_interval = 6.0
 duration = 0.12            # Seconds the eyes stay closed per blink.
 double_chance = 0.15       # Probability of a quick double-blink.
+
+[idle]                     # Idle resting overlay ("smile after silence"). Optional.
+timeout_secs = 8           # Seconds of mic silence before the anim/smile/ overlay
+                           # is shown as the resting face. Disappears when you
+                           # speak. Only active when anim/smile/*.png exists; 0
+                           # disables it.
 
 [webcam]                   # Virtual webcam (Linux v4l2loopback).
 enabled = true
