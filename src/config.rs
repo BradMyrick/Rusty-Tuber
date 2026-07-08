@@ -22,6 +22,9 @@ pub struct AppConfig {
     /// Eye-blink scheduler tuning.
     #[serde(default)]
     pub blink: BlinkSettings,
+    /// Idle resting overlay (the "smile after silence" feature).
+    #[serde(default)]
+    pub idle: IdleSettings,
     /// Virtual webcam output (Linux v4l2loopback). Ignored on non-Linux.
     #[serde(default)]
     pub webcam: WebcamSettings,
@@ -207,6 +210,30 @@ impl Default for BlinkSettings {
             duration: 0.12,
             double_chance: 0.15,
         }
+    }
+}
+
+fn default_idle_timeout() -> f32 {
+    8.0
+}
+
+/// Idle resting-overlay settings. After `[idle].timeout_secs` of mic silence,
+/// the `anim/smile/` overlay (the character's "resting face", e.g. a smile) is
+/// composited on top of the avatar. It disappears as soon as speech resumes.
+///
+/// The overlay is only active when an `anim/smile/*.png` asset exists; with no
+/// such asset the feature is a silent no-op regardless of the timeout. Set
+/// `timeout_secs = 0.0` to disable it.
+#[derive(Debug, Clone, Deserialize)]
+pub struct IdleSettings {
+    /// Seconds of mic silence before the idle resting overlay is shown.
+    #[serde(default = "default_idle_timeout")]
+    pub timeout_secs: f32,
+}
+
+impl Default for IdleSettings {
+    fn default() -> Self {
+        Self { timeout_secs: 8.0 }
     }
 }
 
@@ -400,6 +427,13 @@ impl AppConfig {
             bail!("[blink].double_chance must be in [0.0, 1.0]");
         }
 
+        if !self.idle.timeout_secs.is_finite() || self.idle.timeout_secs < 0.0 {
+            bail!(
+                "[idle].timeout_secs must be a non-negative finite number (got {})",
+                self.idle.timeout_secs
+            );
+        }
+
         Ok(())
     }
 }
@@ -576,5 +610,27 @@ surprised = 2.5
         let cfg = AppConfig::from_toml_str(&raw).unwrap();
         assert_eq!(cfg.webcam.background_image, "backgrounds/office.png");
         assert!(!cfg.webcam.steady);
+    }
+
+    #[test]
+    fn idle_defaults_to_8_seconds() {
+        let cfg = AppConfig::from_toml_str(MINIMAL).unwrap();
+        assert!((cfg.idle.timeout_secs - 8.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn idle_timeout_is_configurable() {
+        let raw = format!("{MINIMAL}\n[idle]\ntimeout_secs = 3.5\n");
+        let cfg = AppConfig::from_toml_str(&raw).unwrap();
+        assert!((cfg.idle.timeout_secs - 3.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn idle_rejects_negative_or_non_finite() {
+        let mk = |toml: &str| {
+            AppConfig::from_toml_str(&format!("{MINIMAL}\n{toml}"))
+        };
+        assert!(mk("[idle]\ntimeout_secs = -1.0\n").is_err());
+        assert!(mk("[idle]\ntimeout_secs = 0.0\n").is_ok()); // 0 disables
     }
 }

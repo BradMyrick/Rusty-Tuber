@@ -73,6 +73,7 @@ pub async fn run(cfg: config::AppConfig) -> Result<()> {
             mouth: protocol::MouthState::Closed,
             eyes: protocol::EyeState::Open,
             anim_frames: vec![0; anim_count],
+            idle: false,
             version: 0,
         });
     let init_frame = compositor.render(
@@ -84,6 +85,7 @@ pub async fn run(cfg: config::AppConfig) -> Result<()> {
         protocol::MouthState::Closed,
         protocol::EyeState::Open,
         &[],
+        false,
     );
     let (frame_tx, _) =
         tokio::sync::watch::channel(std::sync::Arc::new(init_frame));
@@ -108,6 +110,8 @@ pub async fn run(cfg: config::AppConfig) -> Result<()> {
         cfg.timers.clone(),
         default_emotion.clone(),
         anim_count,
+        cfg.idle.timeout_secs,
+        compositor.has_idle_layer(),
         cmd_tx.clone(),
         cmd_rx,
         bcast_tx.clone(),
