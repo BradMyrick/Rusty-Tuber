@@ -1,4 +1,4 @@
-//! Rusty-Tuber CLI entrypoint. All real logic lives in the [`rusty_tuber`]
+//! Rusty-Tuber CLI entrypoint. Logic lives in the [`rusty_tuber`]
 //! library crate; this binary just parses arguments, initialises logging, and
 //! dispatches to [`rusty_tuber::run`] (or the audio-device listing helper).
 
@@ -19,9 +19,7 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// List audio devices reported by cpal, marking loopback (monitor) sources.
     ListAudioDevices,
-    /// Run the headless avatar pipeline (default).
     Run,
 }
 

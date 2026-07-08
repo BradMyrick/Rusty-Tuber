@@ -7,12 +7,14 @@
 //! honours the clear if the token still matches, so a newer emotion trigger
 //! cannot be clobbered by a stale timer (the bug in the original SDD design).
 //!
-//! State changes are broadcast to all subscribers (the WebSocket layer) on a
-//! `tokio::sync::broadcast` channel. Volume-only drift is throttled to ~20 Hz
-//! so the web-app meter stays lively without flooding slow clients.
+//! State changes are broadcast to all subscribers on a `tokio::sync::broadcast`
+//! channel — the library observation seam. The headless binary has no
+//! subscribers (sends are free); embedding code can subscribe to mirror state.
+//! Volume-only drift is throttled to ~20 Hz so a volume meter stays lively
+//! without flooding subscribers.
 //!
 //! In the layered art model the avatar is a static body plus independent eye
-//! and mouth layers. This task resolves the current eye/mouth layer URLs from
+//! and mouth layers. This task resolves the current eye/mouth layer paths from
 //! the catalog and sends them in every `StateUpdate`; the body never changes.
 
 use crate::assets::AssetCatalog;
@@ -315,7 +317,7 @@ impl StateMachine {
         self.eyes_override.unwrap_or(self.eyes)
     }
 
-    /// The currently-displayed eye layer URL (for change detection).
+    /// The currently-displayed eye layer path (for change detection).
     fn current_eyes_frame(&self) -> String {
         self.catalog
             .eyes_frame(self.emotion_for_eyes(), self.effective_eyes())
@@ -401,7 +403,7 @@ impl StateMachine {
             }
             StateCommand::SetEnvelope(config) => {
                 // Write the shared atomics the realtime callback reads — applies
-                // immediately to the live audio stream — then tell the panels.
+                // immediately to the live audio stream — then notify subscribers.
                 self.envelope.set(config.attack_ms, config.release_ms);
                 let _ =
                     self.bcast.send(ServerMessage::EnvelopeUpdate { config });
@@ -454,7 +456,7 @@ impl StateMachine {
         }
     }
 
-    /// Always broadcast the current state (used for discrete client commands).
+    /// Always broadcast the current state (used for discrete commands).
     fn broadcast_now(&mut self) {
         let emotion = self.effective_emotion().to_string();
         let mouth = self.effective_mouth();

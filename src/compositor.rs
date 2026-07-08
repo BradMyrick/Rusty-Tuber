@@ -1,5 +1,5 @@
-//! Server-side avatar compositor — the universal source of truth for what the
-//! avatar looks like at any moment.
+//! Avatar compositor — the universal source of truth for what the avatar looks
+//! like at any moment.
 //!
 //! All layer PNGs are decoded once at startup. [`Compositor::render`] composites
 //! the static base + eye + mouth layers + any custom animation overlays into a
@@ -305,7 +305,7 @@ fn overlay_bbox(bottom: &mut [u8], layer: &Layer, width: u32) {
     }
 }
 
-/// Strip the `/frames/` prefix from a resolved layer URL to get its catalog
+/// Strip the `/frames/` prefix from a resolved layer path to get its catalog
 /// rel-path (the key into the decoded layer cache).
 fn rel_of(url: &str) -> &str {
     url.strip_prefix(crate::assets::FRAMES_URL_PREFIX)

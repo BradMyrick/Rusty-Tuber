@@ -5,25 +5,24 @@
 sample_rate = 44100      # Target sample rate (Hz). cpal negotiates; not guaranteed.
 latency = "low"          # "low" (~256-frame buffers, ~6ms) | "stable" (~1024, ~23ms)
 # buffer_size = 256      # Optional explicit override; omit to use the latency preset.
-attack_ms = 1            # Envelope attack — mouth-open responsiveness. Smaller = snappier.
-release_ms = 40         # Envelope release — mouth-close smoothness. Larger = less flutter.
+attack_ms = 5            # Envelope attack — mouth-open responsiveness. Smaller = snappier.
+release_ms = 60         # Envelope release — mouth-close smoothness. Larger = less flutter.
 mode = "input"           # "input" (mic) | "loopback" (system output via a monitor device)
 device = ""              # "" = system default. Else exact name from `rusty-tuber --list-audio-devices`.
 
 [thresholds]
 # RMS level that must be exceeded to open the mouth to each level.
 # Must satisfy partial < medium < open.
-partial = 0.02
-medium = 0.06
-open = 0.14
+partial = 0.01
+medium = 0.03
+open = 0.15
 # Optional: active mouth levels (default = all four). Lowest enabled = resting.
 enabled = ["closed", "partial", "medium", "open"]
 
 [engine]
 # Resting emotion (eye-set). Empty = base/default eyes.
 default_emotion = ""
-asset_root = "./assets/characters/default_macaw"
-bind = "127.0.0.1:8080"
+asset_root = "./assets/characters/fudder"
 
 # Emotion auto-revert timers (seconds). Empty by default (no emotion art ships).
 [timers]

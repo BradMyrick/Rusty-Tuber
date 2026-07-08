@@ -59,9 +59,9 @@ pub async fn run(cfg: config::AppConfig) -> Result<()> {
     let anim_count: usize =
         compositor.anim_config().iter().map(|c| c.instances).sum();
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<state::StateCommand>();
-    // Broadcast channel is retained as the observation seam: a future control
-    // server subscribes to it to mirror avatar state. With no subscribers the
-    // sends are effectively free (immediate `Err`), so it costs nothing to keep.
+    // Broadcast channel is the library observation seam: a program embedding
+    // this crate can subscribe to mirror avatar state. The headless binary has
+    // no subscribers, so sends are effectively free (immediate `Err`).
     let (bcast_tx, _) = broadcast::channel::<protocol::ServerMessage>(256);
 
     // Render pipeline: state task → RenderRequest (watch) → render thread →
@@ -158,11 +158,11 @@ pub async fn run(cfg: config::AppConfig) -> Result<()> {
     }
 
     // --- Audio capture (dedicated OS thread; cpal Stream lives there) -------
-    let audio_cfg = cfg.audio.clone();
+    //let audio_cfg = cfg.audio.clone();
     let audio_cmd_tx = cmd_tx.clone();
-    let audio_env = envelope.clone();
+    //let audio_env = envelope.clone();
     std::thread::spawn(move || {
-        match audio::start(&audio_cfg, audio_env, audio_cmd_tx) {
+        match audio::start(&cfg.audio, envelope, audio_cmd_tx) {
             Ok(_stream) => {
                 info!("audio capture running");
                 // Hold the stream alive for the lifetime of the process.
@@ -175,10 +175,9 @@ pub async fn run(cfg: config::AppConfig) -> Result<()> {
             ),
         }
     });
-
     // --- Control interface (stdin) -----------------------------------------
-    // The seam for hotkeys / a future server: simple text commands on stdin,
-    // parsed into [`state::StateCommand`]s. See the [`control`] module.
+    // The seam for hotkeys / scripts: simple text commands on stdin, parsed
+    // into [`state::StateCommand`]s. See the [`control`] module.
     control::spawn_stdin(cmd_tx.clone(), catalog.clone());
 
     info!(

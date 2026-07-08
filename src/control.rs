@@ -1,12 +1,12 @@
 //! Control interface: a dependency-free stdin command reader that drives the
 //! avatar by translating simple text commands into [`state::StateCommand`]s.
 //!
-//! This is the **control seam** for headless operation. It reads lines
-//! from stdin; a future server, hotkey daemon, or Stream Deck integration can
-//! either pipe commands here, or — more directly — construct
-//! [`StateCommand`]s and feed the same `mpsc` sender the binary uses (see
-//! [`crate::run`]). The [`protocol`] types (serialize/observe avatar state via
-//! the broadcast channel) round out the surface a custom server would want.
+//! This is the **control seam** for headless operation. It reads lines from
+//! stdin; a hotkey daemon or Stream Deck integration can pipe commands here, or
+//! — more directly — construct [`StateCommand`]s and feed the same `mpsc`
+//! sender the binary uses (see [`crate::run`]). The [`protocol`] types
+//! (observe avatar state via the broadcast channel) round out the surface an
+//! embedding program would want.
 //!
 //! ## Commands
 //!

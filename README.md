@@ -5,8 +5,8 @@ avatar from your microphone volume (plus optional blinks and animations) and
 composite every frame into a **virtual webcam** (`v4l2loopback`) that OBS,
 Zoom, Discord, and browsers all read as a normal camera.
 
-- **No web UI, no server, no browser.** Pure Rust: mic → avatar → webcam. A
-  tiny stdin command interface is the control seam for hotkeys / a future server.
+- **No web UI, no server.** Pure Rust: mic → avatar → webcam. A tiny stdin
+  command interface is the control seam for hotkeys / scripts.
 - **Single universal output.** The compositor renders the avatar (static body +
   eye layer + mouth layer + animation overlays) into one RGBA frame on visible
   change and writes it to a v4l2loopback device. Add a Chroma Key filter in the
@@ -95,7 +95,7 @@ sudo modprobe v4l2loopback exclusive_caps=1 card_label="Rusty-Tuber" video_nr=2
 > device; setting `[webcam].format = "bgr4"` opts out (faster, but Chrome/Firefox
 > won't see it).
 
-The server auto-detects the device (or set `[webcam].device = "/dev/videoN"`).
+Rusty-Tuber auto-detects the device (or set `[webcam].device = "/dev/videoN"`).
 Enable it in `config.toml` (`[webcam] enabled = true`) and (re)start.
 
 #### Make the module load on every boot
@@ -166,14 +166,14 @@ eyes auto
 echo "emotion happy" | ./rusty-tuber --config config.toml
 ```
 
-### Writing your own control server later
+### Embedding / scripting
 
 The stdin reader is just one frontend over a single `mpsc` channel of
-[`state::StateCommand`](src/state.rs) values. A future server / Stream Deck /
-hotkey daemon can embed the library and feed the same channel directly, and
-subscribe to the broadcast channel of [`protocol::ServerMessage`](src/protocol.rs)
-to observe avatar state — the serde types are kept for exactly that purpose.
-See [`src/control.rs`](src/control.rs) and [`src/lib.rs`](src/lib.rs).
+[`state::StateCommand`](src/state.rs) values. A Stream Deck / hotkey daemon /
+embedding program can feed the same channel directly, and subscribe to the
+broadcast channel of [`protocol::ServerMessage`](src/protocol.rs) to observe
+avatar state. See [`src/control.rs`](src/control.rs) and
+[`src/lib.rs`](src/lib.rs).
 
 ---
 
@@ -390,17 +390,18 @@ stdin ──text commands──▶ control ────────────�
   `RenderRequest` to a dedicated render thread (coalesced to `[webcam].fps`,
   since the webcam can't consume more). Token-race-safe revert timers, the blink
   scheduler, and runtime mouth-config + envelope.
-- **`webcam.rs`** *(Linux)* — v4l2loopback sink: alpha-overs the avatar onto the
-  chroma background with an RGBA→YUYV (or BGR4) convert, advertises the frame
-  interval via `VIDIOC_S_PARM`, and writes **event-driven and non-blocking** — a
-  frame the instant the compositor posts one, opening the device `O_NONBLOCK` so
-  a busy reader (OBS) surfaces as a *dropped* frame (smooth) instead of
-  *blocking* (laggy); parks at idle for ~zero CPU; auto-detects the device.
+- **`webcam.rs`** *(Linux)* — v4l2loopback sink: alpha-overs the avatar onto a
+  chroma colour **or** a background image with an RGBA→YUYV (or BGR4) convert,
+  advertises the frame interval via `VIDIOC_S_PARM`, and writes a steady
+  `fps` stream (default) so OBS can't stall/backlog — opening the device
+  `O_NONBLOCK` so a busy reader surfaces as a *dropped* frame (smooth) instead
+  of *blocking* (laggy). `steady = false` restores event-driven, zero-idle-CPU
+  behaviour for WebRTC-only setups. Auto-detects the device.
 - **`control.rs`** — dependency-free stdin command reader; the seam for hotkeys
-  / a future control server.
-- **`protocol.rs`** — serde message types, `MouthState`/`EyeState`, the layered
-  `LayerCatalog`, `MouthConfig`, and `EnvelopeConfig` (kept for a future server
-  that embeds the library).
+  / scripts.
+- **`protocol.rs`** — avatar domain types (`MouthState`/`EyeState`, the layered
+  `LayerCatalog`, `MouthConfig`, `EnvelopeConfig`) plus `ServerMessage`, the
+  broadcast-channel observation type for embedding code.
 
 The hot path (audio callback) only computes an RMS and maybe sends one channel
 message — no allocation, no locking, no image work. The callback body is wrapped
