@@ -1,28 +1,29 @@
 //! Rusty-Tuber library crate: configuration, asset catalog, audio analysis,
-//! avatar state machine, and the HTTP/WebSocket server. The `rusty-tuber`
-//! binary in [`src/main.rs`](../main.rs) is a thin CLI wrapper over these
-//! modules.
+//! avatar state machine, the virtual-webcam compositor, and a dependency-free
+//! stdin control interface. The `rusty-tuber` binary in
+//! [`src/main.rs`](../main.rs) is a thin CLI wrapper over these modules.
 
 pub mod assets;
 pub mod audio;
 pub mod compositor;
 pub mod config;
-pub mod net;
+pub mod control;
 pub mod protocol;
 pub mod state;
 #[cfg(target_os = "linux")]
 pub mod webcam;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use std::sync::Arc;
-use tokio::sync::{broadcast, mpsc, RwLock};
+use tokio::sync::{broadcast, mpsc};
 use tracing::{error, info, warn};
 
-/// Bring up the full server for a validated [`config::AppConfig`].
+/// Bring up the headless avatar pipeline for a validated [`config::AppConfig`].
 ///
-/// Loads the asset catalog, spawns the state task, starts audio capture on a
-/// dedicated OS thread, builds the HTTP/WS router, and serves until a graceful
-/// shutdown signal arrives.
+/// Loads the asset catalog, spawns the state machine + render thread + blink /
+/// animation schedulers, starts the virtual-webcam sink and audio capture, then
+/// runs a stdin command reader (the control seam — see [`control`]) until a
+/// graceful shutdown signal arrives (`Ctrl-C` / `SIGTERM` / the `quit` command).
 pub async fn run(cfg: config::AppConfig) -> Result<()> {
     // --- Asset catalog -----------------------------------------------------
     let catalog = Arc::new(assets::AssetCatalog::load(&cfg.engine.asset_root)?);
@@ -53,15 +54,19 @@ pub async fn run(cfg: config::AppConfig) -> Result<()> {
     let compositor = Arc::new(compositor::Compositor::new(
         catalog.clone(),
         &cfg.engine.asset_root,
+        Some(cfg.webcam.output_size),
     )?);
     let anim_count: usize =
         compositor.anim_config().iter().map(|c| c.instances).sum();
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<state::StateCommand>();
+    // Broadcast channel is the library observation seam: a program embedding
+    // this crate can subscribe to mirror avatar state. The headless binary has
+    // no subscribers, so sends are effectively free (immediate `Err`).
     let (bcast_tx, _) = broadcast::channel::<protocol::ServerMessage>(256);
 
     // Render pipeline: state task → RenderRequest (watch) → render thread →
-    // Frame (watch) → webcam + MJPEG. The state task never blocks on
-    // compositing; the render thread always works from the latest state.
+    // Frame (watch) → webcam. The state task never blocks on compositing; the
+    // render thread always works from the latest state.
     let (render_tx, render_rx) =
         tokio::sync::watch::channel(state::RenderRequest {
             emotion: None,
@@ -82,11 +87,19 @@ pub async fn run(cfg: config::AppConfig) -> Result<()> {
     );
     let (frame_tx, _) =
         tokio::sync::watch::channel(std::sync::Arc::new(init_frame));
-    let frame_tx_for_app = frame_tx.clone();
     #[cfg(target_os = "linux")]
     let webcam_rx = frame_tx.subscribe();
 
-    state::spawn_renderer(compositor.clone(), render_rx, frame_tx.clone());
+    // Producer cadence matches the device's advertised frame rate so renders
+    // never outpace what the webcam can sink (and what it advertises via S_PARM).
+    let render_frame_min =
+        std::time::Duration::from_secs_f32(1.0 / cfg.webcam.fps as f32);
+    state::spawn_renderer(
+        compositor.clone(),
+        render_rx,
+        frame_tx.clone(),
+        render_frame_min,
+    );
 
     let state_handle = state::spawn(
         catalog.clone(),
@@ -104,36 +117,32 @@ pub async fn run(cfg: config::AppConfig) -> Result<()> {
     state::spawn_blink_scheduler(cmd_tx.clone(), cfg.blink.clone());
     state::spawn_anim_scheduler(cmd_tx.clone(), compositor.anim_config());
 
-    // --- Shared HTTP/WS state (control only — no video over WS) -------------
-    let preview_bg = cfg.webcam.background_rgb().unwrap_or([0, 255, 0]);
-    let app_state = Arc::new(net::AppState::new(
-        catalog.clone(),
-        default_emotion,
-        cmd_tx.clone(),
-        bcast_tx.clone(),
-        Arc::new(RwLock::new(None)),
-        Arc::new(RwLock::new(mouth_config)),
-        Arc::new(RwLock::new(protocol::EnvelopeConfig {
-            attack_ms: cfg.audio.attack_ms,
-            release_ms: cfg.audio.release_ms,
-        })),
-        format!("{:?}", cfg.audio.latency).to_ascii_lowercase(),
-        frame_tx_for_app,
-        preview_bg,
-    ));
-    let _recorder = net::spawn_snapshot_recorder(app_state.clone());
+    // --- Virtual webcam sink (Linux v4l2loopback) --------------------------
     #[cfg(target_os = "linux")]
     if cfg.webcam.enabled {
         match (webcam::find_device(&cfg.webcam.device), cfg.webcam.background_rgb()) {
-            (Some(dev), Ok(bg)) => {
-                if let Err(e) = webcam::spawn_webcam(
-                    webcam_rx,
-                    dev.clone(),
-                    cfg.webcam.fps,
-                    cfg.webcam.idle_fps,
-                    bg,
+            (Some(dev), Ok(solid)) => {
+                match webcam::Background::load(
+                    &cfg.webcam.background_image,
+                    solid,
+                    cfg.webcam.output_size,
                 ) {
-                    warn!(error = %format!("{e:#}"), "webcam output disabled");
+                    Ok(bg) => {
+                        if let Err(e) = webcam::spawn_webcam(
+                            webcam_rx,
+                            dev.clone(),
+                            bg,
+                            cfg.webcam.format,
+                            cfg.webcam.fps,
+                            cfg.webcam.steady,
+                        ) {
+                            warn!(error = %format!("{e:#}"), "webcam output disabled");
+                        }
+                    }
+                    Err(e) => warn!(
+                        error = %format!("{e:#}"),
+                        "webcam disabled (could not load [webcam].background_image)",
+                    ),
                 }
             }
             (None, _) => warn!(
@@ -149,11 +158,11 @@ pub async fn run(cfg: config::AppConfig) -> Result<()> {
     }
 
     // --- Audio capture (dedicated OS thread; cpal Stream lives there) -------
-    let audio_cfg = cfg.audio.clone();
+    //let audio_cfg = cfg.audio.clone();
     let audio_cmd_tx = cmd_tx.clone();
-    let audio_env = envelope.clone();
+    //let audio_env = envelope.clone();
     std::thread::spawn(move || {
-        match audio::start(&audio_cfg, audio_env, audio_cmd_tx) {
+        match audio::start(&cfg.audio, envelope, audio_cmd_tx) {
             Ok(_stream) => {
                 info!("audio capture running");
                 // Hold the stream alive for the lifetime of the process.
@@ -161,31 +170,43 @@ pub async fn run(cfg: config::AppConfig) -> Result<()> {
             }
             Err(e) => error!(
                 error = %format!("{e:#}"),
-                "audio capture failed; server will continue (use the web app to drive the avatar manually)"
+                "audio capture failed; avatar will rest with a closed mouth \
+                 (pipe commands to stdin to drive it manually)"
             ),
         }
     });
+    // --- Control interface (stdin) -----------------------------------------
+    // The seam for hotkeys / scripts: simple text commands on stdin, parsed
+    // into [`state::StateCommand`]s. See the [`control`] module.
+    control::spawn_stdin(cmd_tx.clone(), catalog.clone());
 
-    // --- HTTP / WS server --------------------------------------------------
-    let app = net::build_router(app_state.clone(), &cfg.engine.asset_root);
-    let listener = tokio::net::TcpListener::bind(&cfg.engine.bind)
-        .await
-        .with_context(|| format!("binding {}", cfg.engine.bind))?;
-    let bound_addr = listener.local_addr()?;
     info!(
-        bind = %bound_addr,
-        panel = %format!("http://{bound_addr}/"),
-        stage = %format!("http://{bound_addr}/stage.html"),
-        "server listening; add the stage URL as an OBS Browser Source"
+        "rusty-tuber running headless; type `help` on stdin for commands, \
+         Ctrl-C to quit"
     );
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    // --- Run until shutdown ------------------------------------------------
+    // Shutdown is either an OS signal or the state task exiting (which happens
+    // when the `quit` command sends `Shutdown`). Polling a JoinHandle after it
+    // completed panics, so we track which branch fired and only await when the
+    // state task is still running.
+    let mut state_handle = state_handle;
+    let shutdown = shutdown_signal();
+    tokio::pin!(shutdown);
+    let mut state_done = false;
+    tokio::select! {
+        _ = &mut shutdown => info!("received shutdown signal"),
+        _ = &mut state_handle => {
+            info!("control interface requested shutdown");
+            state_done = true;
+        }
+    }
 
     // --- Tear down ---------------------------------------------------------
-    let _ = cmd_tx.send(state::StateCommand::Shutdown);
-    let _ = state_handle.await;
+    if !state_done {
+        let _ = cmd_tx.send(state::StateCommand::Shutdown);
+        let _ = state_handle.await;
+    }
     info!("shutdown complete");
     Ok(())
 }

@@ -1,4 +1,4 @@
-//! Rusty-Tuber CLI entrypoint. All real logic lives in the [`rusty_tuber`]
+//! Rusty-Tuber CLI entrypoint. Logic lives in the [`rusty_tuber`]
 //! library crate; this binary just parses arguments, initialises logging, and
 //! dispatches to [`rusty_tuber::run`] (or the audio-device listing helper).
 
@@ -19,9 +19,7 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// List audio devices reported by cpal, marking loopback (monitor) sources.
     ListAudioDevices,
-    /// Run the server (default).
     Run,
 }
 
@@ -30,9 +28,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| {
-            tracing_subscriber::EnvFilter::new("info,rusty_tuber=debug")
-        });
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(false)

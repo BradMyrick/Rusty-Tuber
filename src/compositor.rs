@@ -1,5 +1,5 @@
-//! Server-side avatar compositor — the universal source of truth for what the
-//! avatar looks like at any moment.
+//! Avatar compositor — the universal source of truth for what the avatar looks
+//! like at any moment.
 //!
 //! All layer PNGs are decoded once at startup. [`Compositor::render`] composites
 //! the static base + eye + mouth layers + any custom animation overlays into a
@@ -37,7 +37,68 @@ pub struct AnimSchedulerConfig {
 }
 
 struct AnimInstance {
-    frames: Vec<RgbaImage>,
+    frames: Vec<Layer>,
+}
+
+/// A decoded overlay layer paired with the bounding box of its non-transparent
+/// pixels (in canvas coordinates). The compositor only blends inside the box,
+/// so a small worm sprite on a 2048² canvas skips ~99% of the pixels.
+struct Layer {
+    img: RgbaImage,
+    bbox: BBox,
+}
+
+/// Half-open pixel rectangle `[x0..x1) × [y0..y1)`. Empty (`x0==x1 || y0==y1`)
+/// means the layer is fully transparent.
+#[derive(Clone, Copy)]
+struct BBox {
+    x0: u32,
+    y0: u32,
+    x1: u32,
+    y1: u32,
+}
+
+impl BBox {
+    const EMPTY: BBox = BBox {
+        x0: 0,
+        y0: 0,
+        x1: 0,
+        y1: 0,
+    };
+}
+
+/// Scan every pixel once and return the tight bounding box of non-transparent
+/// pixels. Used at load time so the per-frame render touches only the region
+/// that actually carries opacity.
+fn opaque_bbox(img: &RgbaImage) -> BBox {
+    let (w, h) = (img.width(), img.height());
+    let raw = img.as_raw();
+    let mut x0 = w;
+    let mut y0 = h;
+    let mut x1 = 0u32;
+    let mut y1 = 0u32;
+    for y in 0..h {
+        for x in 0..w {
+            let a = raw[((y * w + x) * 4 + 3) as usize];
+            if a != 0 {
+                if x < x0 {
+                    x0 = x;
+                }
+                if x >= x1 {
+                    x1 = x + 1;
+                }
+                if y < y0 {
+                    y0 = y;
+                }
+                y1 = y + 1;
+            }
+        }
+    }
+    if x0 >= x1 || y0 >= y1 {
+        BBox::EMPTY
+    } else {
+        BBox { x0, y0, x1, y1 }
+    }
 }
 
 #[derive(Deserialize)]
@@ -73,7 +134,7 @@ pub struct Compositor {
     width: u32,
     height: u32,
     base_composited: Vec<u8>,
-    layers: HashMap<String, RgbaImage>,
+    layers: HashMap<String, Layer>,
     catalog: Arc<AssetCatalog>,
     anim_instances: Vec<AnimInstance>,
     anim_config: Vec<AnimSchedulerConfig>,
@@ -81,15 +142,25 @@ pub struct Compositor {
 
 impl Compositor {
     /// Decode every layer referenced by the catalog under `asset_root`.
-    pub fn new(catalog: Arc<AssetCatalog>, asset_root: &Path) -> Result<Self> {
-        let mut layers: HashMap<String, RgbaImage> = HashMap::new();
+    ///
+    /// `output_size`, if set, scales every layer to that square edge at load
+    /// time (all character art is 1:1), so the whole pipeline — composite, blend,
+    /// device write — runs at that resolution instead of the (often much larger)
+    /// native art size. Cost scales with pixels, so this is the single biggest
+    /// perf lever for a webcam output.
+    pub fn new(
+        catalog: Arc<AssetCatalog>,
+        asset_root: &Path,
+        output_size: Option<u32>,
+    ) -> Result<Self> {
+        let mut layers: HashMap<String, Layer> = HashMap::new();
 
         // Base.
         let mut base = Vec::new();
         for rel in &catalog.catalog().base {
-            decode_into(asset_root, rel, &mut layers)?;
-            if let Some(img) = layers.get(rel) {
-                base.push(img.clone());
+            decode_into(asset_root, rel, &mut layers, output_size)?;
+            if let Some(layer) = layers.get(rel) {
+                base.push(layer.img.clone());
             }
         }
         if base.is_empty() {
@@ -111,27 +182,27 @@ impl Compositor {
             .into_iter()
             .flatten()
         {
-            decode_into(asset_root, rel, &mut layers)?;
+            decode_into(asset_root, rel, &mut layers, output_size)?;
         }
         // Default eyes + every emotion eye-set.
         let e = &catalog.catalog().default_eyes;
         if let Some(r) = &e.open {
-            decode_into(asset_root, r, &mut layers)?;
+            decode_into(asset_root, r, &mut layers, output_size)?;
         }
         if let Some(r) = &e.closed {
-            decode_into(asset_root, r, &mut layers)?;
+            decode_into(asset_root, r, &mut layers, output_size)?;
         }
         for set in catalog.catalog().emotions.values() {
             if let Some(r) = &set.open {
-                decode_into(asset_root, r, &mut layers)?;
+                decode_into(asset_root, r, &mut layers, output_size)?;
             }
             if let Some(r) = &set.closed {
-                decode_into(asset_root, r, &mut layers)?;
+                decode_into(asset_root, r, &mut layers, output_size)?;
             }
         }
 
         // Custom animation channels from character.toml.
-        let (anim_instances, anim_config) = load_anim(asset_root)?;
+        let (anim_instances, anim_config) = load_anim(asset_root, output_size)?;
 
         info!(
             width,
@@ -152,9 +223,9 @@ impl Compositor {
     }
 
     /// Composite the avatar for the current state. Copies the pre-composited
-    /// base (cheap memcpy) then overlays the eye + mouth layers with a
-    /// skip-transparent blit — those layers are sparse, so most pixels are
-    /// skipped. The result keeps a transparent background; sinks fill it.
+    /// base (memcpy) then overlays the eye/mouth/anim layers. Each overlay is
+    /// cropped to its precomputed opaque bounding box, so a sparse layer (a
+    /// small worm sprite on a 2048² canvas) blends only its occupied pixels.
     pub fn anim_config(&self) -> &[AnimSchedulerConfig] {
         &self.anim_config
     }
@@ -169,19 +240,19 @@ impl Compositor {
         let mut rgba = Vec::with_capacity(self.base_composited.len());
         rgba.extend_from_slice(&self.base_composited);
         if let Some(url) = self.catalog.eyes_frame(emotion, eyes) {
-            if let Some(img) = self.layers.get(rel_of(&url)) {
-                overlay_skip(&mut rgba, img.as_raw());
+            if let Some(layer) = self.layers.get(rel_of(&url)) {
+                overlay_bbox(&mut rgba, layer, self.width);
             }
         }
         if let Some(url) = self.catalog.mouth_frame(mouth) {
-            if let Some(img) = self.layers.get(rel_of(&url)) {
-                overlay_skip(&mut rgba, img.as_raw());
+            if let Some(layer) = self.layers.get(rel_of(&url)) {
+                overlay_bbox(&mut rgba, layer, self.width);
             }
         }
         for (i, inst) in self.anim_instances.iter().enumerate() {
             let f = anim_frames.get(i).copied().unwrap_or(0);
-            if let Some(img) = inst.frames.get(f) {
-                overlay_skip(&mut rgba, img.as_raw());
+            if let Some(layer) = inst.frames.get(f) {
+                overlay_bbox(&mut rgba, layer, self.width);
             }
         }
         Frame {
@@ -192,39 +263,49 @@ impl Compositor {
     }
 }
 
-/// Alpha-over `top` onto `bottom` (both flat RGBA byte slices), skipping fully
-/// transparent source pixels and fast-pathing opaque ones. Eye/mouth layers are
-/// mostly transparent, so this is far cheaper than the generic per-pixel blend.
-fn overlay_skip(bottom: &mut [u8], top: &[u8]) {
-    let pixels = bottom.len() / 4;
-    for i in 0..pixels {
-        let j = i * 4;
-        let a = top[j + 3] as u32;
-        if a == 0 {
-            continue;
-        }
-        if a == 255 {
-            // Fully opaque source — straight copy.
-            bottom[j] = top[j];
-            bottom[j + 1] = top[j + 1];
-            bottom[j + 2] = top[j + 2];
-            bottom[j + 3] = 255;
-        } else {
-            let inv = 255 - a;
-            bottom[j] =
-                ((a * top[j] as u32 + inv * bottom[j] as u32) / 255) as u8;
-            bottom[j + 1] = ((a * top[j + 1] as u32
-                + inv * bottom[j + 1] as u32)
-                / 255) as u8;
-            bottom[j + 2] = ((a * top[j + 2] as u32
-                + inv * bottom[j + 2] as u32)
-                / 255) as u8;
-            bottom[j + 3] = (a + inv * bottom[j + 3] as u32 / 255) as u8;
+/// Alpha-over `layer` onto `bottom` (flat RGBA), restricted to the layer's
+/// opaque bounding box. Fully-transparent source pixels are skipped and opaque
+/// ones are fast-pathed; semi-transparent ones get the exact `/255` blend.
+fn overlay_bbox(bottom: &mut [u8], layer: &Layer, width: u32) {
+    let bbox = layer.bbox;
+    if bbox.x0 >= bbox.x1 || bbox.y0 >= bbox.y1 {
+        return;
+    }
+    let top = layer.img.as_raw();
+    for y in bbox.y0..bbox.y1 {
+        let row_start = (y * width + bbox.x0) as usize * 4;
+        let row_end = (y * width + bbox.x1) as usize * 4;
+        let mut bi = row_start;
+        for ti in (row_start..row_end).step_by(4) {
+            let a = top[ti + 3] as u32;
+            if a == 0 {
+                bi += 4;
+                continue;
+            }
+            if a == 255 {
+                bottom[bi] = top[ti];
+                bottom[bi + 1] = top[ti + 1];
+                bottom[bi + 2] = top[ti + 2];
+                bottom[bi + 3] = 255;
+            } else {
+                let inv = 255 - a;
+                let div = |sum: u32| (sum + (sum >> 8) + 1) >> 8;
+                bottom[bi] =
+                    div(a * top[ti] as u32 + inv * bottom[bi] as u32) as u8;
+                bottom[bi + 1] =
+                    div(a * top[ti + 1] as u32 + inv * bottom[bi + 1] as u32)
+                        as u8;
+                bottom[bi + 2] =
+                    div(a * top[ti + 2] as u32 + inv * bottom[bi + 2] as u32)
+                        as u8;
+                bottom[bi + 3] = 255;
+            }
+            bi += 4;
         }
     }
 }
 
-/// Strip the `/frames/` prefix from a resolved layer URL to get its catalog
+/// Strip the `/frames/` prefix from a resolved layer path to get its catalog
 /// rel-path (the key into the decoded layer cache).
 fn rel_of(url: &str) -> &str {
     url.strip_prefix(crate::assets::FRAMES_URL_PREFIX)
@@ -233,7 +314,11 @@ fn rel_of(url: &str) -> &str {
         .unwrap_or(url)
 }
 
-fn load_layer(root: &Path, rel: &str) -> Result<RgbaImage> {
+fn load_layer(
+    root: &Path,
+    rel: &str,
+    output_size: Option<u32>,
+) -> Result<RgbaImage> {
     let path = root.join(rel);
     let img = image::open(&path)
         .with_context(|| format!("compositor: decoding {}", path.display()))?;
@@ -241,20 +326,33 @@ fn load_layer(root: &Path, rel: &str) -> Result<RgbaImage> {
     if rgba.width() == 0 || rgba.height() == 0 {
         anyhow::bail!("compositor: empty image {}", path.display());
     }
-    Ok(rgba)
+    Ok(fit(rgba, output_size))
+}
+
+/// Scale a square layer to `output_size` (Lanczos3, one-time at load). No-op
+/// when `output_size` is `None` or already matches. All character art is 1:1.
+fn fit(img: RgbaImage, output_size: Option<u32>) -> RgbaImage {
+    match output_size {
+        Some(s) if s != img.width() || s != img.height() => {
+            imageops::resize(&img, s, s, imageops::FilterType::Lanczos3)
+        }
+        _ => img,
+    }
 }
 
 /// Decode `rel` into the shared layer cache (no-op if empty or already cached).
 fn decode_into(
     root: &Path,
     rel: &str,
-    layers: &mut HashMap<String, RgbaImage>,
+    layers: &mut HashMap<String, Layer>,
+    output_size: Option<u32>,
 ) -> Result<()> {
     if rel.is_empty() || layers.contains_key(rel) {
         return Ok(());
     }
-    let img = load_layer(root, rel)?;
-    layers.insert(rel.to_string(), img);
+    let img = load_layer(root, rel, output_size)?;
+    let bbox = opaque_bbox(&img);
+    layers.insert(rel.to_string(), Layer { img, bbox });
     Ok(())
 }
 
@@ -263,6 +361,7 @@ fn decode_into(
 /// animated layer, plus the timing config the scheduler needs.
 fn load_anim(
     root: &Path,
+    output_size: Option<u32>,
 ) -> Result<(Vec<AnimInstance>, Vec<AnimSchedulerConfig>)> {
     let toml_path = root.join("character.toml");
     if !toml_path.exists() {
@@ -286,7 +385,10 @@ fn load_anim(
                     .replace("{f}", &f.to_string());
                 let path = dir.join(&fname);
                 if path.exists() {
-                    frames.push(image::open(&path)?.to_rgba8());
+                    let img = image::open(&path)?.to_rgba8();
+                    let img = fit(img, output_size);
+                    let bbox = opaque_bbox(&img);
+                    frames.push(Layer { img, bbox });
                 } else {
                     warn!(file = %path.display(), "animation frame missing");
                 }
@@ -378,7 +480,7 @@ mod tests {
     fn render_composites_and_resolves_nearest_mouth() {
         let dir = tempdir();
         let (cat, root) = fake_catalog(&dir);
-        let comp = Compositor::new(cat, &root).unwrap();
+        let comp = Compositor::new(cat, &root, None).unwrap();
         // Mouth=Partial snaps to closed (nearest). The top-left pixel should be
         // the mouth (green) since the mouth is drawn over the white eyes over
         // the red base — last-wins at (0,0) is mouth green.

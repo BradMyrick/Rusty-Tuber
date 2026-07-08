@@ -3,7 +3,7 @@
 //! Walks the configured asset root once at startup and builds a
 //! [`LayerCatalog`] describing the independent transparent PNG layers that
 //! composite into the avatar. All layers must share the same canvas size (the
-//! web client stacks them pixel-aligned).
+//! compositor stacks them pixel-aligned).
 //!
 //! ## Layout
 //!
@@ -38,7 +38,9 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use tracing::warn;
 
-/// URL prefix under which the HTTP layer serves the asset root.
+/// Path prefix prepended to resolved layer paths (e.g. `/frames/eyes/open.png`).
+/// Historical namespacing kept stable as the change-detection key the state task
+/// compares between frames; the compositor strips it back off (`rel_of`).
 pub const FRAMES_URL_PREFIX: &str = "/frames";
 
 /// Mouth level names ordered from resting to fully open.
@@ -77,7 +79,7 @@ impl AssetCatalog {
         }))
     }
 
-    /// Borrow the wire catalog (for the `Welcome` message / `/api/catalog`).
+    /// Borrow the layer catalog (for embedding code that inspects assets).
     pub fn catalog(&self) -> &LayerCatalog {
         &self.0
     }
@@ -92,14 +94,14 @@ impl AssetCatalog {
         self.0.emotions.contains_key(&emotion.to_ascii_lowercase())
     }
 
-    /// Resolve the `/frames/...` URL for the current mouth level (snapping to
+    /// Resolve the `/frames/...` path for the current mouth level (snapping to
     /// the nearest available frame), or `None` if the catalog has none.
     pub fn mouth_frame(&self, mouth: MouthState) -> Option<String> {
         nearest_mouth(&self.0.mouths, mouth)
             .map(|rel| format!("{FRAMES_URL_PREFIX}/{rel}"))
     }
 
-    /// Resolve the `/frames/...` URL for the current eye state, honouring the
+    /// Resolve the `/frames/...` path for the current eye state, honouring the
     /// active emotion's eye set (falling back to the default eyes, and to
     /// `open` when a blink has no `closed` frame for this expression).
     pub fn eyes_frame(
@@ -212,9 +214,9 @@ fn load_eye_set(root: &Path, dir: &Path, what: &str) -> EyeLayers {
     layers
 }
 
-/// Path of `file` relative to the asset root, with forward slashes so it's
-/// URL-ready (e.g. `eyes/happy/open.png`). Falls back to the bare filename if
-/// `file` isn't under `root`.
+/// Path of `file` relative to the asset root, with forward slashes for
+/// platform-independent keys (e.g. `eyes/happy/open.png`). Falls back to the
+/// bare filename if `file` isn't under `root`.
 fn rel_from(root: &Path, file: &Path) -> String {
     file.strip_prefix(root)
         .ok()

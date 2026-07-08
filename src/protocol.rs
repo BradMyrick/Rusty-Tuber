@@ -1,8 +1,6 @@
-//! Wire protocol shared between the Rust server and the web app.
-//!
-//! Messages use the adjacent-tagged envelope:
-//! `{"type":"TriggerEmotion","payload":{"emotion":"happy"}}` — implemented via
-//! `#[serde(tag = "type", content = "payload")]`.
+//! Avatar domain model: mouth levels, eye state, the layered asset catalog, and
+//! the envelope/mouth tuning types shared across config, state, assets, and the
+//! compositor.
 //!
 //! ## Layered art model
 //!
@@ -24,8 +22,13 @@
 //! layer to that expression; the mouth keeps reacting to the mic. With no
 //! emotion art, the resting avatar is just base + default eyes + mic mouth.
 //!
-//! The server resolves the current eye/mouth layer URLs and sends them in every
-//! `StateUpdate`, so the web client only has to stack three `<img>` layers.
+//! ## Observation seam
+//!
+//! [`ServerMessage`] is posted on a `tokio::sync::broadcast` channel whenever
+//! the visible avatar state changes. The headless binary has no subscribers
+//! (sends are free), but a program embedding this crate can subscribe to mirror
+//! or log avatar state. The serde tagging is kept stable for that purpose:
+//! `{"type":"StateUpdate","payload":{...}}`.
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -73,7 +76,7 @@ impl MouthState {
 /// positions. Thresholds must stay strictly ordered `partial < medium < open`
 /// regardless of which levels are enabled (disabled levels' thresholds are
 /// simply unused until re-enabled).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MouthConfig {
     pub enabled: [bool; 4],
     pub partial: f32,
@@ -133,8 +136,8 @@ impl MouthConfig {
 /// Audio envelope tuning: `attack_ms` is how fast the mouth opens on talk-start
 /// (smaller = snappier), `release_ms` how gently it closes on talk-end (larger =
 /// smoother, less flutter). Drives the asymmetric one-pole envelope in the audio
-/// callback; adjustable live from the panel.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// callback; configured via `[audio]` in `config.toml`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EnvelopeConfig {
     pub attack_ms: f32,
     pub release_ms: f32,
@@ -194,7 +197,8 @@ pub struct EyeLayers {
     pub closed: Option<String>,
 }
 
-/// The full layered asset catalog, sent to clients on connect.
+/// The resolved on-disk asset catalog: base layers + mouths + the default eye
+/// expression + optional emotion eye-sets.
 ///
 /// - `base` is stacked bottom-up (filename order) and rendered statically.
 /// - `default_eyes` is the resting expression.
@@ -208,81 +212,18 @@ pub struct LayerCatalog {
     pub emotions: BTreeMap<String, EyeLayers>,
 }
 
-/// Serializable avatar snapshot, used for the REST `GET /api/state` endpoint.
-/// Serialize-only server-side; clients parse `StateUpdate` over the WS instead.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AvatarSnapshot {
-    pub emotion: String,
-    pub mouth: MouthState,
-    pub eyes: EyeState,
-    pub volume: f32,
-    /// True while any override (emotion / mouth / eyes) is active.
-    pub overridden: bool,
-    /// True while a mouth override is active (client uses this for UI state).
-    pub mouth_overridden: bool,
-    /// True while an eyes override is active (client uses this for UI state).
-    pub eyes_overridden: bool,
-    /// Resolved `/frames/...` URL for the current eye layer.
-    pub eyes_frame: String,
-    /// Resolved `/frames/...` URL for the current mouth layer.
-    pub mouth_frame: String,
-    pub default_emotion: String,
-}
-
-// ---------------------------------------------------------------------------
-// Client -> Server
-// ---------------------------------------------------------------------------
-
-/// Messages accepted from web-app / API clients.
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(tag = "type", content = "payload", rename_all = "PascalCase")]
-pub enum ClientMessage {
-    /// Switch to an emotion (eye-expression set); auto-reverts after its
-    /// configured timer (if any).
-    TriggerEmotion { emotion: String },
-    /// Drop any active emotion override and return to the resting emotion.
-    ClearOverride,
-    /// Change the resting emotion (applied when no override is active).
-    SetDefault { emotion: String },
-    /// Force a specific mouth shape, ignoring mic input.
-    SetMouthOverride { mouth: MouthState },
-    /// Release a forced mouth shape; resume mic-driven motion.
-    ClearMouthOverride,
-    /// Update the mouth-level configuration (enabled levels + thresholds).
-    SetMouthConfig { config: MouthConfig },
-    /// Update the audio envelope (attack/release).
-    SetEnvelope { config: EnvelopeConfig },
-    /// Force the eyes open or closed, ignoring the blink scheduler.
-    SetEyesOverride { eyes: EyeState },
-    /// Release a forced eye state; resume blinking.
-    ClearEyesOverride,
-    /// First message a client sends after connecting (optional handshake).
-    Hello,
-}
-
-// ---------------------------------------------------------------------------
-// Server -> Client
-// ---------------------------------------------------------------------------
-
-/// Messages pushed from the server to connected clients.
+/// Avatar-state observation messages, posted on the library's `broadcast`
+/// channel (see [`crate::run`]). The headless binary has no subscribers, so
+/// these sends are effectively free; embedding code can subscribe to mirror or
+/// log state. Tagged as `{"type":"...","payload":{...}}`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "payload", rename_all = "PascalCase")]
 pub enum ServerMessage {
-    /// Sent once on (re)connect: the catalog (for the panel UI), the current
-    /// resting emotion, mouth + envelope config, and the active latency preset.
-    Welcome {
-        catalog: LayerCatalog,
-        default_emotion: String,
-        mouth_config: MouthConfig,
-        envelope: EnvelopeConfig,
-        latency: String,
-    },
-    /// Authoritative avatar state. Sent on every change and throttled for
-    /// volume-only drift. `eyes_frame` / `mouth_frame` are the resolved layer
-    /// URLs to display; the base layer comes from the `Welcome` catalog and
-    /// never changes. `overridden` is true if any override is active;
-    /// `mouth_overridden` / `eyes_overridden` flag the per-channel overrides so
-    /// every client highlights the same control without tracking local state.
+    /// Authoritative avatar state. Posted on every visible change and throttled
+    /// for volume-only drift. `eyes_frame` / `mouth_frame` are the resolved
+    /// layer paths to composite; the base layer is static and never changes.
+    /// `overridden` is true if any override is active; `mouth_overridden` /
+    /// `eyes_overridden` flag the per-channel overrides.
     StateUpdate {
         emotion: String,
         mouth: MouthState,
@@ -295,37 +236,16 @@ pub enum ServerMessage {
         mouth_frame: String,
         default_emotion: String,
     },
-    /// Human-readable error (e.g. unknown emotion).
-    Error { message: String },
-    /// Broadcast whenever the mouth-level configuration changes (via panel or
-    /// REST) so every connected panel stays in sync. OBS sources ignore this.
+    /// Posted when the mouth-level configuration changes, so subscribers stay
+    /// in sync.
     MouthConfigUpdate { config: MouthConfig },
-    /// Broadcast whenever the audio envelope changes.
+    /// Posted when the audio envelope changes.
     EnvelopeUpdate { config: EnvelopeConfig },
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn client_message_roundtrip_matches_envelope() {
-        let json = r#"{"type":"TriggerEmotion","payload":{"emotion":"happy"}}"#;
-        let msg: ClientMessage = serde_json::from_str(json).expect("parse");
-        match msg {
-            ClientMessage::TriggerEmotion { emotion } => {
-                assert_eq!(emotion, "happy")
-            }
-            other => panic!("unexpected variant {other:?}"),
-        }
-    }
-
-    #[test]
-    fn clear_override_has_no_payload() {
-        let json = r#"{"type":"ClearOverride"}"#;
-        let msg: ClientMessage = serde_json::from_str(json).expect("parse");
-        assert!(matches!(msg, ClientMessage::ClearOverride));
-    }
 
     #[test]
     fn server_state_update_roundtrips() {
@@ -376,47 +296,6 @@ mod tests {
             MouthState::from_str_ci("PARTIAL"),
             Some(MouthState::Partial)
         );
-    }
-
-    #[test]
-    fn welcome_catalog_roundtrips() {
-        let cat = LayerCatalog {
-            base: vec!["base/body.png".into()],
-            mouths: MouthLayers {
-                closed: Some("mouths/closed.png".into()),
-                partial: None,
-                medium: None,
-                open: Some("mouths/open.png".into()),
-            },
-            default_eyes: EyeLayers {
-                open: Some("eyes/open.png".into()),
-                closed: Some("eyes/closed.png".into()),
-            },
-            emotions: BTreeMap::new(),
-        };
-        let welcome = ServerMessage::Welcome {
-            catalog: cat,
-            default_emotion: "default".into(),
-            mouth_config: MouthConfig::all_enabled(0.02, 0.08, 0.18),
-            envelope: EnvelopeConfig {
-                attack_ms: 6.0,
-                release_ms: 110.0,
-            },
-            latency: "low".into(),
-        };
-        let s = serde_json::to_string(&welcome).unwrap();
-        let back: ServerMessage = serde_json::from_str(&s).unwrap();
-        match back {
-            ServerMessage::Welcome {
-                catalog,
-                default_emotion,
-                ..
-            } => {
-                assert_eq!(catalog.base, vec!["base/body.png".to_string()]);
-                assert_eq!(default_emotion, "default");
-            }
-            _ => panic!("wrong variant"),
-        }
     }
 
     #[test]

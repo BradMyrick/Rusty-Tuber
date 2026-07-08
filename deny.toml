@@ -1,0 +1,41 @@
+# cargo-deny configuration.
+# Docs: https://embarkstudios.github.io/cargo-deny/
+
+[advisories]
+# Fail the build on any known-vulnerable dependency (RUSTSEC db-default).
+db-urls = ["https://github.com/rustsec/advisory-db"]
+# Treat yanked crates as warnings, not hard errors (common for transitive deps).
+yanked = "warn"
+
+[licenses]
+# Allow common permissive licenses. Add more here if a new dep needs one.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-DFS-2016",
+    "Unicode-3.0",
+    "CC0-1.0",
+    "0BSD",
+]
+confidence-threshold = 0.93
+
+[bans]
+# Allow duplicates of small utility crates; flag only large ones manually.
+multiple-versions = "warn"
+wildcards = "deny"
+# Reject crates known to be unmaintained or superseded.
+deny = [
+    { name = "openssl", use-instead = "rustls" },
+    { name = "chrono", version = "*", use-instead = "time" },
+]
+
+[sources]
+# Only allow crates from crates.io; no git/file deps unless explicitly allowed.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

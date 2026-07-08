@@ -113,7 +113,7 @@ fn pick_device(audio: &AudioSettings) -> Result<Device> {
 
     if !audio.device.is_empty() {
         for d in host.input_devices()? {
-            if d.name().map(|n| n == audio.device).unwrap_or(false) {
+            if d.name().map(|n: String| n == audio.device).unwrap_or(false) {
                 return Ok(d);
             }
         }

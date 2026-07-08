@@ -4,6 +4,10 @@ on:
   push:
     branches: [main]
   pull_request:
+  schedule:
+    # Weekly supply-chain audit (advisories + licenses), Sunday 09:00 UTC.
+    - cron: "0 9 * * 0"
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -42,3 +46,16 @@ jobs:
 
       - name: Tests
         run: cargo test --all-targets --all-features
+
+  # Supply-chain security: RUSTSEC advisories, banned crates, and license
+  # policy. Runs on PRs/pushes that touch the lockfile, plus the weekly
+  # schedule above so new advisories are caught even without activity.
+  audit:
+    name: cargo-deny (advisories + licenses)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          arguments: --all-features check advisories bans licenses sources
+          command: check

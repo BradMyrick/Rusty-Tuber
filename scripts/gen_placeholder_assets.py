@@ -1,8 +1,8 @@
 # Rusty-Tuber placeholder-asset generator.
 #
 # Produces the layered placeholder art (base body + mouth levels + eye frames)
-# so the server and OBS Browser Source can be exercised without real art. All
-# layers share a 512x512 transparent canvas so they composite pixel-aligned.
+# so Rusty-Tuber and OBS can be exercised without real art. All layers share a
+# 512x512 transparent canvas so they composite pixel-aligned.
 #
 # This regenerates the WHOLE character folder's placeholder layers. If you've
 # dropped in real art, back it up first or edit the paths below.
